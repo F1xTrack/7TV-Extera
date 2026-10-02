@@ -1,0 +1,2773 @@
+"""7TV Twitch-channel emotes in the exteraGram composer."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+from android.graphics import Bitmap, BitmapFactory, Canvas, Movie
+from android.graphics.drawable import BitmapDrawable, ColorDrawable
+from android.os import SystemClock
+from android.text import (
+    Annotation,
+    SpannableString,
+    SpannableStringBuilder,
+    Spanned,
+    TextUtils,
+    TextWatcher,
+)
+from android.text.style import ImageSpan, ReplacementSpan
+from android.view import Gravity, MotionEvent, View
+from android.widget import BaseAdapter, GridView, HorizontalScrollView, ImageView, LinearLayout, PopupWindow, TextView
+from android.widget import EditText as AndroidEditText
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import (
+    PLUGINS_QUEUE,
+    get_file_loader,
+    get_last_fragment,
+    get_notification_center,
+    run_on_queue,
+    send_request,
+)
+from extera_utils.classes import Base, java_subclass, joverride
+from hook_utils import find_class, get_private_field, set_private_field
+from java import dynamic_proxy, jclass
+from java.io import FileOutputStream
+from java.lang import Integer, Object, System
+from java.lang.ref import WeakReference
+from java.nio import ByteBuffer
+from org.telegram.messenger import (
+    AndroidUtilities,
+    ApplicationLoader,
+    MediaDataController,
+    NotificationCenter,
+    UserConfig,
+)
+from org.telegram.tgnet import TLRPC, ConnectionsManager
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import AnimatedEmojiSpan
+from ui.bulletin import BulletinHelper
+from ui.settings import EditText, Header, Switch, Text
+
+__id__ = "seven_tv_emojis"
+__name__ = "7TV Emojis"
+__description__ = (
+    "Добавляет вкладку и подсказки 7TV и Twitch, показывает смайлы в поле ввода и загружает их "
+    "как Telegram custom emoji при первой отправке."
+)
+__version__ = "0.1"
+__app_version__ = ">=12.1.1"
+__sdk_version__ = ">=1.4.4.3"
+__author__ = "@F1xTrack"
+
+
+_GQL_URL = "https://api.7tv.app/v4/gql"
+_TWITCH_CATALOG_URL = "https://emotes.crippled.dev/v1"
+_TWITCH_GLOBAL = "__twitch_global__"
+_ALT = "🙂"
+_PACK_TITLE = "SevenTV Emotes"
+_VIDEO_MAX_BYTES = 256_000
+_VIDEO_TARGET_BYTES = 240_000
+_VIDEO_PROFILES = (
+    (128000, 30), (64000, 30), (32000, 30), (16000, 24),
+    (8000, 20), (4000, 15), (2000, 12),
+)
+_WORD_RE = re.compile(r"\S+")
+_CHANNEL_RE = re.compile(r"^[A-Za-z0-9_]{2,25}$")
+_USER_QUERY = """
+query($name: String!) {
+  users { search(query: $name, perPage: 20) {
+    items { connections { platform platformUsername platformAvatarUrl platformDisplayName }
+      style { activeEmoteSet { id } activeProfilePicture { images { url scale } } } }
+  } }
+}
+"""
+_SET_QUERY = """
+query($id: Id!, $page: Int!) {
+  emoteSets { emoteSet(id: $id) { emotes(page: $page, perPage: 1000) {
+    pageCount totalCount items { alias emote { id images {
+      url width height mime frameCount scale
+    } } }
+  } } }
+}
+"""
+
+
+def _java_list(values):
+    """Read Java lists without relying on the bridge's Python iterator support."""
+    return [values.get(index) for index in range(int(values.size()))]
+
+
+def _utf16_offsets(text):
+    result = [0]
+    offset = 0
+    for char in text:
+        offset += 2 if ord(char) > 0xFFFF else 1
+        result.append(offset)
+    return result
+
+
+def _channels(value):
+    result = []
+    seen = set()
+    for raw in re.split(r"[,\s]+", str(value or "")):
+        name = raw.strip().removeprefix("https://www.twitch.tv/").strip("/")
+        if _CHANNEL_RE.fullmatch(name) and name.lower() not in seen:
+            result.append(name.lower())
+            seen.add(name.lower())
+    return result
+
+
+def _choose_images(images):
+    """Use an actual CDN rendition, never resize it for Telegram upload."""
+    pngs = [
+        image for image in images
+        if image.get("mime") == "image/png"
+        and int(image.get("frameCount", 0)) == 1
+        and image.get("url")
+    ]
+    if not pngs:
+        return None, None
+    usable = [image for image in pngs if 0 < int(image.get("height", 0)) <= 100]
+    source = (
+        max(usable, key=lambda item: int(item.get("height", 0)))
+        if usable else min(pngs, key=lambda item: int(item.get("height", 0)))
+    )
+    preview = min(pngs, key=lambda item: int(item.get("scale", 99)))
+    return source, preview
+
+
+def _choose_animation(images, source):
+    gifs = [
+        image for image in images
+        if image.get("mime") == "image/gif"
+        and int(image.get("frameCount", 0)) > 1
+        and image.get("url")
+    ]
+    if not gifs:
+        return None, None
+    candidates = [
+        image for image in gifs
+        if int(image.get("width", 0)) == int(source["width"])
+        and int(image.get("height", 0)) == int(source["height"])
+    ]
+    if not candidates:
+        raise ValueError("7TV did not provide a matching GIF rendition")
+    return candidates[0], min(gifs, key=lambda item: int(item.get("scale", 99)))
+
+
+def _tile_origins(width, height, size=100):
+    """Return square crop origins. Padding is transparent; pixels are unscaled."""
+    if width <= 0 or height <= 0:
+        return []
+    return [
+        (x, y)
+        for y in range(0, height, size)
+        for x in range(0, width, size)
+    ]
+
+
+def _picker_items(emotes, query, channel=None):
+    query = str(query or "").strip().casefold()
+    return sorted(
+        (emote for emote in emotes.values()
+         if (channel is None or emote.channel.casefold() == channel.casefold())
+         and (not query or query in emote.code.casefold() or query in emote.channel.casefold()
+              or query in emote.provider.casefold())),
+        key=lambda emote: (emote.code.casefold(), emote.code),
+    )
+
+
+def _picker_insertion(prefix, suffix, code):
+    left = " " if prefix and not prefix[-1].isspace() else ""
+    right = " " if not suffix or not suffix[0].isspace() else ""
+    return left + code + right
+
+
+class _Emote:
+    __slots__ = (
+        "animation_url", "channel", "channel_avatar_url", "channel_display_name", "code", "emote_id",
+        "preview_animation_url", "preview_url", "source_url", "provider",
+    )
+
+    def __init__(
+        self, channel, code, emote_id, source_url, preview_url,
+        animation_url=None, preview_animation_url=None,
+        channel_avatar_url=None, channel_display_name=None, provider="7TV",
+    ):
+        self.channel = channel
+        self.channel_avatar_url = channel_avatar_url
+        self.channel_display_name = channel_display_name or channel
+        self.code = code
+        self.emote_id = emote_id
+        self.source_url = source_url
+        self.preview_url = preview_url
+        self.animation_url = animation_url
+        self.preview_animation_url = preview_animation_url
+        self.provider = provider
+
+
+def _emote_source(emote):
+    if emote.channel == _TWITCH_GLOBAL:
+        return "Twitch · глобальные"
+    return f"{emote.provider} · @{emote.channel}"
+
+
+def _parse_twitch_emotes(items, channel=None):
+    if not isinstance(items, list):
+        raise ValueError("Twitch catalogue did not return an emote list")
+    emotes = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("provider") != 0:
+            continue
+        code = item.get("code")
+        if not isinstance(code, str) or not code or any(char.isspace() for char in code):
+            continue
+        emote_id = None
+        for image in item.get("urls") or []:
+            if not isinstance(image, dict) or not isinstance(image.get("url"), str):
+                continue
+            parsed = urlparse(image["url"])
+            if parsed.scheme != "https" or parsed.netloc != "static-cdn.jtvnw.net":
+                continue
+            match = re.fullmatch(
+                r"/emoticons/v2/([A-Za-z0-9_-]{1,128})/(?:default|static|animated)/(?:light|dark)/[123]\.0",
+                parsed.path,
+            )
+            if match:
+                emote_id = match.group(1)
+                break
+        if emote_id is None:
+            continue
+        base = f"https://static-cdn.jtvnw.net/emoticons/v2/{emote_id}"
+        animated = item.get("animated") is True
+        # The 2x rendition is normally 56px high; 3x is 112px and would
+        # unnecessarily split a square Twitch emote into four 100px tiles.
+        emotes.append(_Emote(
+            channel or _TWITCH_GLOBAL, code, "twitch_" + emote_id,
+            base + "/static/dark/2.0", base + "/static/dark/1.0",
+            base + "/animated/dark/2.0" if animated else None,
+            base + "/animated/dark/1.0" if animated else None,
+            channel_display_name=channel or "Twitch", provider="Twitch",
+        ))
+    if items and not emotes:
+        raise ValueError("Twitch catalogue contains no valid Twitch emotes")
+    return emotes
+
+
+class _EnterViewConstructed(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            account = int(param.args[2].getCurrentAccount())
+        except Exception:
+            account = int(UserConfig.selectedAccount)
+        self.plugin._attach_editor(param.thisObject, account)
+
+
+class _SendHook(MethodHook):
+    def __init__(self, plugin, editing=False):
+        self.plugin = plugin
+        self.editing = editing
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin._defer_send(
+                param.thisObject, tuple(param.args), self.editing
+            ):
+                param.setResult(None if self.editing else False)
+        except Exception as exc:
+            self.plugin.log(f"7TV: send preparation failed: {exc}")
+            param.setResult(None if self.editing else False)
+            BulletinHelper.show_error(f"7TV: не удалось подготовить сообщение: {exc}")
+
+
+class _EntitiesHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            key = int(System.identityHashCode(param.thisObject))
+            account = self.plugin._media_accounts.get(key)
+            if account is None:
+                account = int(param.thisObject.JA.currentAccount)
+            box = param.args[0]
+            if box is not None and box[0] is not None:
+                converted = self.plugin._convert_entities(box[0], account)
+                if converted is not None:
+                    box[0] = converted
+        except Exception as exc:
+            self.plugin.log(f"7TV: entity conversion failed: {exc}")
+
+
+class _EmojiPanelHook(MethodHook):
+    def __init__(self, plugin, attach=False, close_search=False):
+        self.plugin = plugin
+        self.attach = attach
+        self.close_search = close_search
+
+    def after_hooked_method(self, param):
+        try:
+            if self.close_search:
+                state = self.plugin._panels.get(int(System.identityHashCode(param.thisObject)))
+                if state is not None:
+                    self.plugin._close_picker_search(state)
+            elif self.attach:
+                self.plugin._attach_emoji_panel(param.thisObject)
+            else:
+                self.plugin._attach_emoji_panel(param.thisObject)
+        except Exception as exc:
+            self.plugin.log(f"7TV: picker integration failed: {exc}")
+
+
+class _EnterEmojiPanelHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            enter = param.thisObject
+            panel = enter.getEmojiView()
+            if panel is not None:
+                self.plugin._attach_emoji_panel(panel, enter)
+        except Exception as exc:
+            self.plugin._picker_notice(f"Не удалось подключить панель: {exc}")
+
+
+class _EmojiPagerHook(MethodHook):
+    def __init__(self, plugin, method):
+        self.plugin = plugin
+        self.operation = method
+
+    def before_hooked_method(self, param):
+        state = self.plugin._panels_by_adapter.get(int(System.identityHashCode(param.thisObject)))
+        if state is None:
+            return
+        if self.operation == "getCount":
+            state["count_hook_hits"] = state.get("count_hook_hits", 0) + 1
+            owner = state["owner_ref"].get()
+            tabs = get_private_field(owner, "currentTabs") if owner is not None else None
+            if tabs is not None:
+                state["native_count"] = int(tabs.size()) - int(self.plugin._native_picker_tab_present(state, tabs))
+            if self.plugin._panel_available(state):
+                # setResult takes Object. Plain Python int is boxed as Long;
+                # the int-returning Java method requires an actual Integer.
+                param.setResult(Integer(4))
+            return
+        if self.operation == "getItemPosition":
+            root = self.plugin._panel_view(state, "root")
+            if root is not None and int(System.identityHashCode(param.args[0])) == int(System.identityHashCode(root)):
+                param.setResult(Integer(-2))  # PagerAdapter.POSITION_NONE.
+            return
+        position = int(param.args[1] if self.operation == "instantiateItem" else param.args[0])
+        if position != 3 or not self.plugin._panel_available(state):
+            return
+        if self.operation == "getPageTitle":
+            param.setResult("7TV")
+        elif self.operation == "getPageIconDrawable":
+            param.setResult(None)  # Use the tab's text label.
+        elif self.operation == "canScrollToTab":
+            owner = state["owner_ref"].get()
+            param.setResult(not bool(get_private_field(owner, "emojiBanned")))
+        elif self.operation == "instantiateItem":
+            root = self.plugin._ensure_picker_page(state)
+            parent = param.args[0]
+            old_parent = root.getParent()
+            if old_parent is not None and int(System.identityHashCode(old_parent)) != int(System.identityHashCode(parent)):
+                old_parent.removeView(root)
+            if root.getParent() is None:
+                parent.addView(root)
+            param.setResult(root)
+
+
+@java_subclass(BaseAdapter)
+class _PickerAdapter(Base):
+    def __init__(self, plugin, state):
+        self.plugin = plugin
+        self.state = state
+
+    @joverride()
+    def getCount(self):
+        return len(self.state["items"]) if self.plugin._alive else 0
+
+    @joverride()
+    def getItem(self, position):
+        return self.state["items"][int(position)].code
+
+    @joverride()
+    def getItemId(self, position):
+        return int(position)
+
+    @joverride()
+    def getView(self, position, recycled, parent):
+        return self.plugin._picker_cell(self.state, int(position), recycled, parent)
+
+
+class _PickerClick(dynamic_proxy(jclass("android.widget.AdapterView$OnItemClickListener"))):
+    def __init__(self, plugin, state):
+        super().__init__()
+        self.plugin = plugin
+        self.state = state
+
+    def onItemClick(self, parent, view, position, item_id):
+        self.plugin._pick_emote(self.state, int(position))
+
+
+class _PickerChannelClick(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+    def __init__(self, plugin, state, channel):
+        super().__init__()
+        self.plugin = plugin
+        self.state = state
+        self.channel = channel
+
+    def onClick(self, _view):
+        self.plugin._select_picker_channel(self.state, self.channel)
+
+
+class _PickerSearch(dynamic_proxy(TextWatcher)):
+    def __init__(self, plugin, state):
+        super().__init__()
+        self.plugin = plugin
+        self.state = state
+
+    def beforeTextChanged(self, text, start, count, after):
+        pass
+
+    def onTextChanged(self, text, start, before, count):
+        pass
+
+    def afterTextChanged(self, text):
+        self.state["query"] = str(text)
+        self.plugin._refresh_picker_content(self.state)
+
+
+class _PickerSearchTouch(dynamic_proxy(jclass("android.view.View$OnTouchListener"))):
+    def __init__(self, plugin, state):
+        super().__init__()
+        self.plugin = plugin
+        self.state = state
+
+    def onTouch(self, view, event):
+        if int(event.getActionMasked()) == MotionEvent.ACTION_DOWN:
+            self.plugin._open_picker_search(self.state, view)
+        return False  # Let EditText handle selection, focus and keyboard normally.
+
+
+@java_subclass(Object, TextWatcher)
+class _ComposerWatcher(Base):
+    def __init__(self, plugin, editor, account):
+        self.plugin = plugin
+        self.editor_ref = WeakReference(editor)
+        self.account = int(account)
+        self.busy = False
+        self.spans = []
+        self.peers = []
+        self.animated = False
+        self.revision = 0
+        self.choices = {}
+        self.suggestion_popup = None
+        self.suggestion_row = None
+        self.suggestion_records = []
+
+    @joverride()
+    def beforeTextChanged(self, text, start, count, after):
+        pass
+
+    @joverride()
+    def onTextChanged(self, text, start, before, count):
+        if not self.busy:
+            self.plugin._shift_composer_choices(self, int(start), int(before), int(count))
+
+    @joverride()
+    def afterTextChanged(self, editable):
+        if not self.busy:
+            self.revision += 1
+            self.plugin._decorate(self, editable)
+
+
+class _ComposerSuggestionClick(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+    def __init__(self, plugin, watcher, emote, start, end):
+        super().__init__()
+        self.plugin = plugin
+        self.watcher = watcher
+        self.emote = emote
+        self.start = start
+        self.end = end
+
+    def onClick(self, _view):
+        self.plugin._select_composer_suggestion(
+            self.watcher, self.emote, self.start, self.end
+        )
+
+
+@java_subclass(ReplacementSpan)
+class _AnimatedPreviewSpan(Base):
+    def __init__(self, movie, width, height):
+        self.movie = movie
+        self.width = int(width)
+        self.height = int(height)
+        self.bitmap = Bitmap.createBitmap(
+            int(movie.width()), int(movie.height()), Bitmap.Config.ARGB_8888
+        )
+        self.bitmap.setDensity(0)
+        self.surface = Canvas(self.bitmap)
+
+    @joverride()
+    def getSize(self, paint, text, start, end, metrics):
+        if metrics is not None:
+            original = paint.getFontMetricsInt()
+            metrics.ascent = original.ascent
+            metrics.descent = original.descent
+            metrics.top = original.top
+            metrics.bottom = original.bottom
+        return self.width
+
+    @joverride()
+    def draw(self, canvas, text, start, end, x, top, baseline, bottom, paint):
+        duration = max(1, int(self.movie.duration()))
+        self.movie.setTime(int(SystemClock.uptimeMillis() % duration))
+        self.bitmap.eraseColor(0)
+        self.movie.draw(self.surface, 0.0, 0.0)
+        canvas.save()
+        try:
+            canvas.translate(float(x), float(baseline + paint.getFontMetricsInt().ascent))
+            canvas.scale(
+                self.width / float(self.movie.width()),
+                self.height / float(self.movie.height()),
+            )
+            canvas.drawBitmap(self.bitmap, 0.0, 0.0, None)
+        finally:
+            canvas.restore()
+
+
+class _UploadObserver(dynamic_proxy(jclass(
+    "org.telegram.messenger.NotificationCenter$NotificationCenterDelegate"
+))):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def didReceivedNotification(self, event_id, account, args):
+        self.plugin._on_upload_event(int(event_id), int(account), args)
+
+
+class SevenTvEmojisPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._alive = True
+        self._enabled = bool(self.get_setting("enabled", True))
+        self._channels_text = str(self.get_setting("channels", "") or "")
+        self._generation = 0
+        self._emotes = {}
+        self._emotes_by_code = {}
+        self._status = "Укажите Twitch-каналы в настройках"
+        self._editors = {}
+        self._media_accounts = {}
+        self._markers = {}
+        self._visuals = {}
+        self._previews = {}
+        self._loading_previews = set()
+        self._channel_avatar_bitmaps = {}
+        self._loading_channel_avatars = set()
+        self._channel_avatar_urls = {}
+        self._channel_profiles = {}
+        self._animation_scheduled = False
+        self._pending = {}
+        self._waiting = {}
+        self._queues = {}
+        self._active = {}
+        self._uploads = {}
+        self._observers = {}
+        self._panels = {}
+        self._panels_by_adapter = {}
+        self._picker_adapter_hooks = set()
+        self._picker_status = "Ожидание открытия панели"
+
+        files = ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath()
+        self._storage = Path(str(files)) / "seven_tv_emojis"
+        self._storage.mkdir(parents=True, exist_ok=True)
+        self._cache_path = self._storage / "documents.json"
+        self._doc_cache = self._read_cache()
+
+        enter_class = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+        media_class = find_class("org.telegram.messenger.MediaDataController")
+        if enter_class is None or media_class is None:
+            self._status = "Не найдены классы Telegram"
+            self.log(f"7TV: {self._status}")
+            return
+
+        self.hook_all_constructors(enter_class, _EnterViewConstructed(self))
+        self.hook_all_methods(enter_class, "sendMessageInternal", _SendHook(self))
+        self.hook_all_methods(enter_class, "doneEditingMessage", _SendHook(self, True))
+        self.hook_all_methods(media_class, "getEntities", _EntitiesHook(self))
+        self._setup_picker_hooks()
+        run_on_ui_thread(self._attach_current_chat)
+        self._reload_channels()
+
+    def on_plugin_unload(self):
+        self._alive = False
+        self._generation += 1
+        run_on_ui_thread(self._cleanup_ui)
+
+    def _cleanup_ui(self):
+        self._refresh_emoji_panels()
+        for state in tuple(self._panels.values()):
+            self._clear_picker_cells(state)
+        self._panels.clear()
+        self._panels_by_adapter.clear()
+        for account, observer in tuple(self._observers.items()):
+            center = get_notification_center(account)
+            center.removeObserver(observer, NotificationCenter.fileUploaded)
+            center.removeObserver(observer, NotificationCenter.fileUploadFailed)
+        self._observers.clear()
+        for watcher in tuple(self._editors.values()):
+            editor = watcher.editor_ref.get()
+            self._hide_composer_suggestions(watcher)
+            if editor is not None:
+                self._remove_spans(watcher, editor.getText())
+                editor.removeTextChangedListener(watcher.java)
+        self._editors.clear()
+        self._media_accounts.clear()
+        self._markers.clear()
+        self._visuals.clear()
+        self._pending.clear()
+
+    def create_settings(self):
+        return [
+            Header(text="7TV и Twitch в сообщениях"),
+            Switch(
+                key="enabled",
+                text="Показывать и отправлять 7TV и Twitch",
+                default=True,
+                on_change=self._on_enabled,
+            ),
+            EditText(
+                key="channels",
+                hint="t2x2, bratishkinoff",
+                default="",
+                multiline=True,
+                max_length=2000,
+                on_change=self._on_channels,
+            ),
+            Text(
+                text="Обновить смайлы каналов",
+                subtext="Глобальные Twitch-эмодзи и наборы каналов Twitch/7TV",
+                accent=True,
+                on_click=self._on_reload,
+            ),
+            Text(text="Состояние", subtext=getattr(self, "_status", "")),
+            Text(text="Вкладка 7TV", subtext=getattr(self, "_picker_status", "")),
+            Text(
+                text="Загрузка в Telegram",
+                subtext=(
+                    "Первое отправление смайла создаёт личный emoji-пак. "
+                    "Широкие изображения делятся на квадраты 100×100 без сжатия."
+                ),
+            ),
+            Text(
+                text="Telegram Premium",
+                subtext="Для отправки custom emoji аккаунту нужен Premium.",
+            ),
+        ]
+
+    def _on_enabled(self, value):
+        self._enabled = bool(value)
+        if not self._enabled:
+            self._pending.clear()
+        run_on_ui_thread(self._refresh_ui)
+
+    def _refresh_ui(self):
+        self._refresh_editors()
+        self._refresh_emoji_panels()
+
+    def _on_channels(self, value):
+        self._channels_text = str(value or "")
+        self._pending.clear()
+        self._reload_channels()
+
+    def _on_reload(self, _view):
+        self._reload_channels()
+
+    def _premium(self, account):
+        if not self._enabled:
+            return False
+        try:
+            return bool(UserConfig.getInstance(int(account)).isPremium())
+        except Exception:
+            return False
+
+    def _read_cache(self):
+        try:
+            value = json.loads(self._cache_path.read_text("utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_cache(self):
+        temp = self._cache_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(self._doc_cache, ensure_ascii=False), "utf-8")
+        os.replace(temp, self._cache_path)
+
+    def _account_cache(self, account):
+        user_id = int(UserConfig.getInstance(int(account)).getClientUserId())
+        return self._doc_cache.setdefault(str(user_id), {"packs": [], "emotes": {}})
+
+    def _cached_tiles(self, account, emote_id):
+        tiles = self._account_cache(account)["emotes"].get(emote_id)
+        if not isinstance(tiles, list) or not tiles:
+            return None
+        try:
+            result = [(int(item["id"]), str(item["alt"])) for item in tiles]
+            return result if all(doc > 0 and alt for doc, alt in result) else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _gql(query, variables):
+        body = json.dumps({"query": query, "variables": variables}).encode()
+        request = Request(
+            _GQL_URL,
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "exteraGram-7TV/2"},
+        )
+        with urlopen(request, timeout=20) as response:
+            result = json.load(response)
+        if result.get("errors"):
+            raise RuntimeError(str(result["errors"][0].get("message", "7TV error")))
+        return result["data"]
+
+    def _reload_channels(self):
+        self._generation += 1
+        generation = self._generation
+        names = _channels(self._channels_text)
+        self._status = "Загрузка Twitch и 7TV: " + ", ".join(names) if names else "Загрузка глобальных Twitch-эмодзи"
+        run_on_queue(lambda: self._fetch_channels(generation, names), PLUGINS_QUEUE, 800)
+
+    def _fetch_twitch_emotes(self, channel=None):
+        if channel is not None and not _CHANNEL_RE.fullmatch(channel):
+            raise ValueError("Invalid Twitch channel name")
+        route = f"channel/{channel}/twitch" if channel else "global/twitch"
+        cache_name = f"channel_{channel}" if channel else "global"
+        path = self._storage / f"twitch_catalog_{cache_name}.json"
+        try:
+            request = Request(
+                f"{_TWITCH_CATALOG_URL}/{route}",
+                headers={"User-Agent": "exteraGram-7TV/2", "Accept": "application/json"},
+            )
+            with urlopen(request, timeout=15) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError("Twitch catalogue exceeds 4 MB")
+            items = json.loads(raw)
+            emotes = _parse_twitch_emotes(items, channel)
+        except Exception as exc:
+            try:
+                cached = _parse_twitch_emotes(json.loads(path.read_text("utf-8")), channel)
+            except (OSError, ValueError, TypeError):
+                raise RuntimeError(f"Twitch {channel or 'global'}: {exc}") from exc
+            self.log(f"7TV: Twitch {channel or 'global'} catalogue unavailable, using cache: {exc}")
+            return cached
+        temp = self._temporary_path(path)
+        try:
+            temp.write_bytes(raw)
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+        return emotes
+
+    def _fetch_channels(self, generation, names):
+        if not self._alive or generation != self._generation:
+            return
+        collected = {}
+        channel_profiles = {}
+        errors = []
+        try:
+            global_emotes = self._fetch_twitch_emotes()
+            for emote in global_emotes:
+                collected[(emote.code, emote.channel, "Twitch")] = emote
+            icon = next((emote for emote in global_emotes if emote.code == "Kappa"), None)
+            channel_profiles[_TWITCH_GLOBAL] = {
+                "display_name": "Twitch", "avatar_url": icon.preview_url if icon else None,
+            }
+        except Exception as exc:
+            errors.append(str(exc))
+        for name in names:
+            if not self._alive or generation != self._generation:
+                return
+            try:
+                for emote in self._fetch_twitch_emotes(name):
+                    collected[(emote.code, name, "Twitch")] = emote
+                channel_profiles[name] = {"display_name": name, "avatar_url": None}
+            except Exception as exc:
+                errors.append(str(exc))
+            try:
+                data = self._gql(_USER_QUERY, {"name": name})
+                users = data["users"]["search"]["items"]
+                user = next(
+                    (
+                        item for item in users
+                        if any(
+                            conn["platform"] == "TWITCH"
+                            and conn["platformUsername"].lower() == name
+                            for conn in item["connections"]
+                        )
+                    ),
+                    None,
+                )
+                connection = next(
+                    (
+                        conn for conn in user["connections"]
+                        if conn["platform"] == "TWITCH"
+                        and conn["platformUsername"].lower() == name
+                    ),
+                    None,
+                ) if user else None
+                avatar_url = connection.get("platformAvatarUrl") if connection else None
+                if not avatar_url and user:
+                    profile = (user.get("style") or {}).get("activeProfilePicture")
+                    images = profile.get("images", []) if profile else []
+                    if images:
+                        avatar_url = min(images, key=lambda image: int(image.get("scale", 99))).get("url")
+                if connection:
+                    channel_profiles[name] = {
+                        "avatar_url": avatar_url,
+                        "display_name": connection.get("platformDisplayName") or name,
+                    }
+                set_id = user["style"]["activeEmoteSet"]["id"] if user and user["style"]["activeEmoteSet"] else None
+                if not set_id:
+                    errors.append(f"{name}: активный набор не найден")
+                    continue
+                page = 1
+                while True:
+                    if not self._alive or generation != self._generation:
+                        return
+                    result = self._gql(_SET_QUERY, {"id": set_id, "page": page})
+                    emotes = result["emoteSets"]["emoteSet"]["emotes"]
+                    for item in emotes["items"]:
+                        code = item["alias"]
+                        if not code or any(char.isspace() for char in code):
+                            continue
+                        source, preview = _choose_images(item["emote"]["images"])
+                        key = (code, name)
+                        if source and key not in collected:
+                            animation, preview_animation = _choose_animation(
+                                item["emote"]["images"], source
+                            )
+                            collected[key] = _Emote(
+                                name, code, item["emote"]["id"],
+                                source["url"], preview["url"],
+                                animation["url"] if animation else None,
+                                preview_animation["url"] if preview_animation else None,
+                                channel_profiles.get(name, {}).get("avatar_url"),
+                                channel_profiles.get(name, {}).get("display_name", name),
+                            )
+                    if page >= int(emotes["pageCount"]):
+                        break
+                    page += 1
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        run_on_ui_thread(lambda: self._finish_channels(generation, collected, errors, channel_profiles))
+
+    def _finish_channels(self, generation, collected, errors, channel_profiles=None):
+        if not self._alive or generation != self._generation:
+            return
+        self._emotes = collected
+        self._emotes_by_code = {}
+        for emote in collected.values():
+            self._emotes_by_code.setdefault(emote.code, []).append(emote)
+        for choices in self._emotes_by_code.values():
+            choices.sort(key=lambda item: (item.channel.casefold(), item.emote_id))
+        active_channels = {emote.channel for emote in collected.values()}
+        channel_profiles = channel_profiles or {}
+        old_avatar_urls = self._channel_avatar_urls
+        self._channel_profiles = {
+            channel: profile for channel, profile in channel_profiles.items()
+            if channel in active_channels
+        }
+        self._channel_avatar_urls = {
+            channel: profile.get("avatar_url")
+            for channel, profile in self._channel_profiles.items()
+            if profile.get("avatar_url")
+        }
+        for channel, old_url in tuple(old_avatar_urls.items()):
+            if old_url != self._channel_avatar_urls.get(channel):
+                bitmap = self._channel_avatar_bitmaps.pop(channel, None)
+                if bitmap is not None:
+                    bitmap.recycle()
+        self._status = f"Кодов 7TV/Twitch: {len(self._emotes_by_code)}, вариантов: {len(collected)}"
+        if errors:
+            self._status += "; " + "; ".join(errors[:3])
+        self.log(f"7TV: {self._status}")
+        self.set_setting("_status", self._status, reload_settings=True)
+        self._refresh_editors()
+        self._refresh_emoji_panels()
+
+    def _attach_current_chat(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                view = fragment.getChatActivityEnterView()
+                if view is not None:
+                    self._attach_editor(view, int(fragment.getCurrentAccount()))
+        except Exception:
+            pass
+
+    def _attach_editor(self, enter_view, account):
+        if not self._alive or enter_view is None:
+            return
+        try:
+            controller = MediaDataController.getInstance(account)
+            self._media_accounts[int(System.identityHashCode(controller))] = int(account)
+            editor = enter_view.messageEditText
+            if editor is None:
+                return
+            key = int(System.identityHashCode(editor))
+            if key in self._editors and self._editors[key].editor_ref.get() is not None:
+                return
+            watcher = _ComposerWatcher.new_instance(init_args=[self, editor, account])
+            editor.addTextChangedListener(watcher.java)
+            self._editors[key] = watcher
+            self._decorate(watcher, editor.getText())
+            panel = enter_view.getEmojiView()
+            if panel is not None:
+                self._attach_emoji_panel(panel, enter_view)
+        except Exception as exc:
+            self.log(f"7TV: composer attach failed: {exc}")
+
+    def _remove_spans(self, watcher, editable):
+        for span in watcher.spans:
+            try:
+                self._markers.pop(int(System.identityHashCode(span)), None)
+                self._visuals.pop(int(System.identityHashCode(span)), None)
+                editable.removeSpan(span)
+            except Exception:
+                pass
+        watcher.spans.clear()
+        for peer in watcher.peers:
+            peer.bitmap.recycle()
+        watcher.peers.clear()
+        watcher.animated = False
+
+    def _matches(self, plain, choices=None):
+        offsets = _utf16_offsets(plain)
+        for match in _WORD_RE.finditer(plain):
+            code = match.group(0)
+            candidates = self._emotes_by_code.get(code)
+            if not candidates:
+                continue
+            span = (offsets[match.start()], offsets[match.end()])
+            emote = choices.get(span) if choices is not None else None
+            if emote not in candidates:
+                if choices is not None:
+                    choices.pop(span, None)
+                emote = candidates[0]
+            yield match.start(), match.end(), emote
+
+    @staticmethod
+    def _shift_composer_choices(watcher, start, before, count):
+        end = start + before
+        delta = count - before
+        shifted = {}
+        for (first, last), emote in watcher.choices.items():
+            if before == 0 and start == first:
+                continue
+            if start < first and end <= first:
+                shifted[(first + delta, last + delta)] = emote
+            elif start >= last:
+                shifted[(first, last)] = emote
+        watcher.choices = shifted
+
+    def _suggestion_context(self, watcher, editable):
+        editor = watcher.editor_ref.get()
+        if editor is None or not editor.isFocused():
+            return None
+        first, last = int(editor.getSelectionStart()), int(editor.getSelectionEnd())
+        if first < 0 or first != last:
+            return None
+        plain = str(editable)
+        offsets = _utf16_offsets(plain)
+        cursor = next((index for index, offset in enumerate(offsets) if offset == first), None)
+        if cursor is None:
+            return None
+        token_start = cursor
+        while token_start > 0 and not plain[token_start - 1].isspace():
+            token_start -= 1
+        token_end = cursor
+        while token_end < len(plain) and not plain[token_end].isspace():
+            token_end += 1
+        query = plain[token_start:cursor]
+        if not query:
+            return None
+        return offsets[token_start], offsets[token_end], query
+
+    def _suggestion_candidates(self, query):
+        folded = query.casefold()
+        candidates = [
+            emote for items in self._emotes_by_code.values() for emote in items
+            if folded in emote.code.casefold()
+        ]
+        candidates.sort(key=lambda emote: (
+            0 if emote.code.casefold() == folded else
+            1 if emote.code.casefold().startswith(folded) else 2,
+            emote.code.casefold().find(folded), emote.code.casefold(),
+            emote.channel.casefold(), emote.emote_id,
+        ))
+        exact_count = sum(emote.code.casefold() == folded for emote in candidates)
+        return candidates[:max(12, exact_count)]
+
+    @staticmethod
+    def _clear_composer_suggestion_records(watcher):
+        for record in watcher.suggestion_records:
+            peer = record.get("peer")
+            if peer is not None:
+                peer.bitmap.recycle()
+        watcher.suggestion_records = []
+
+    def _hide_composer_suggestions(self, watcher):
+        popup = watcher.suggestion_popup
+        if popup is not None:
+            try:
+                if popup.isShowing():
+                    popup.dismiss()
+            except Exception:
+                pass
+        row = watcher.suggestion_row
+        if row is not None:
+            try:
+                row.removeAllViews()
+            except Exception:
+                pass
+        self._clear_composer_suggestion_records(watcher)
+
+    def _update_composer_suggestions(self, watcher, editable):
+        if not self._alive or not self._enabled or not self._premium(watcher.account):
+            self._hide_composer_suggestions(watcher)
+            return
+        context = self._suggestion_context(watcher, editable)
+        if context is None:
+            self._hide_composer_suggestions(watcher)
+            return
+        start, end, query = context
+        candidates = self._suggestion_candidates(query)
+        if not candidates:
+            self._hide_composer_suggestions(watcher)
+            return
+        editor = watcher.editor_ref.get()
+        height = AndroidUtilities.dp(64)
+        if watcher.suggestion_popup is None:
+            scroll = HorizontalScrollView(editor.getContext())
+            scroll.setHorizontalScrollBarEnabled(False)
+            scroll.setBackgroundColor(Theme.getColor(Theme.key_chat_messagePanelBackground))
+            row = LinearLayout(editor.getContext())
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            scroll.addView(row, jclass("android.widget.FrameLayout$LayoutParams")(-2, -1))
+            popup = PopupWindow(
+                scroll, -1, height, False,
+            )
+            popup.setFocusable(False)
+            popup.setTouchable(True)
+            popup.setOutsideTouchable(True)
+            popup.setBackgroundDrawable(ColorDrawable(
+                Theme.getColor(Theme.key_chat_messagePanelBackground)
+            ))
+            popup.setElevation(AndroidUtilities.dp(4))
+            watcher.suggestion_popup = popup
+            watcher.suggestion_row = row
+        row = watcher.suggestion_row
+        self._clear_composer_suggestion_records(watcher)
+        row.removeAllViews()
+        code_start = start
+        code_end = end
+        for emote in candidates:
+            chip = LinearLayout(editor.getContext())
+            chip.setOrientation(LinearLayout.HORIZONTAL)
+            chip.setGravity(Gravity.CENTER_VERTICAL)
+            chip.setPadding(AndroidUtilities.dp(6), 0, AndroidUtilities.dp(8), 0)
+            chip.setContentDescription(
+                f"{emote.code}, {_emote_source(emote)}"
+            )
+            chip.setOnClickListener(_ComposerSuggestionClick(
+                self, watcher, emote, code_start, code_end
+            ))
+            thumb = TextView(editor.getContext())
+            thumb.setGravity(Gravity.CENTER)
+            thumb.setTextSize(22.0)
+            thumb.setLayoutParams(LinearLayout.LayoutParams(
+                AndroidUtilities.dp(40), AndroidUtilities.dp(48)
+            ))
+            preview = self._previews.get(emote.emote_id)
+            record = {"thumb_ref": WeakReference(thumb), "peer": None}
+            watcher.suggestion_records.append(record)
+            if preview is None:
+                thumb.setText("…")
+                self._load_preview(emote)
+            elif emote.preview_animation_url:
+                peer = _AnimatedPreviewSpan.new_instance(init_args=[
+                    preview, AndroidUtilities.dp(34), AndroidUtilities.dp(34),
+                ])
+                record["peer"] = peer
+                content = SpannableString(" ")
+                content.setSpan(
+                    peer.java, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+                thumb.setText(content)
+            else:
+                width, image_height = int(preview.getWidth()), int(preview.getHeight())
+                scale = min(
+                    AndroidUtilities.dp(34) / max(1, width),
+                    AndroidUtilities.dp(34) / max(1, image_height),
+                )
+                drawable = BitmapDrawable(thumb.getResources(), preview)
+                drawable.setBounds(
+                    0, 0, max(1, round(width * scale)),
+                    max(1, round(image_height * scale)),
+                )
+                content = SpannableString(" ")
+                content.setSpan(
+                    ImageSpan(drawable, ImageSpan.ALIGN_BOTTOM),
+                    0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+                thumb.setText(content)
+            chip.addView(thumb)
+            labels = LinearLayout(editor.getContext())
+            labels.setOrientation(LinearLayout.VERTICAL)
+            code = TextView(editor.getContext())
+            code.setText(emote.code)
+            code.setTextSize(12.0)
+            code.setSingleLine(True)
+            code.setEllipsize(TextUtils.TruncateAt.END)
+            code.setTextColor(Theme.getColor(Theme.key_chat_messagePanelText))
+            labels.addView(code, LinearLayout.LayoutParams(-2, AndroidUtilities.dp(22)))
+            source = TextView(editor.getContext())
+            source.setText(_emote_source(emote))
+            source.setTextSize(10.0)
+            source.setSingleLine(True)
+            source.setEllipsize(TextUtils.TruncateAt.END)
+            source.setTextColor(Theme.getColor(Theme.key_chat_messagePanelHint))
+            labels.addView(source, LinearLayout.LayoutParams(-2, AndroidUtilities.dp(18)))
+            chip.addView(labels, LinearLayout.LayoutParams(
+                AndroidUtilities.dp(84), AndroidUtilities.dp(48)
+            ))
+            row.addView(chip, LinearLayout.LayoutParams(-2, height))
+        if any(record.get("peer") is not None for record in watcher.suggestion_records):
+            if not self._animation_scheduled:
+                self._animation_scheduled = True
+                run_on_ui_thread(self._animation_tick, 33)
+        popup = watcher.suggestion_popup
+        y_offset = -int(editor.getHeight()) - height
+        if popup.isShowing():
+            popup.update(editor, 0, y_offset, -1, height)
+        else:
+            popup.showAsDropDown(editor, 0, y_offset)
+
+    def _select_composer_suggestion(self, watcher, emote, start, end):
+        editor = watcher.editor_ref.get()
+        if editor is None or not self._alive or not self._premium(watcher.account):
+            return
+        text = editor.getText()
+        if start < 0 or end <= start or end > int(text.length()):
+            self._hide_composer_suggestions(watcher)
+            return
+        self._insert_composer_emote(watcher, editor, start, end, emote)
+
+    def _insert_composer_emote(self, watcher, editor, start, end, emote):
+        text = editor.getText()
+        prefix = str(text.subSequence(0, start))
+        suffix = str(text.subSequence(end, int(text.length())))
+        left = " " if prefix and not prefix[-1].isspace() else ""
+        right = " " if not suffix or not suffix[0].isspace() else ""
+        insertion = left + emote.code + right
+        emote_start = start + _utf16_offsets(left)[-1]
+        emote_end = emote_start + _utf16_offsets(emote.code)[-1]
+        delta = _utf16_offsets(insertion)[-1] - (end - start)
+        shifted = {}
+        for (first, last), choice in watcher.choices.items():
+            if last <= start:
+                shifted[(first, last)] = choice
+            elif first >= end:
+                shifted[(first + delta, last + delta)] = choice
+        watcher.busy = True
+        try:
+            text.replace(start, end, insertion)
+            editor.setSelection(start + _utf16_offsets(insertion)[-1])
+            shifted[(emote_start, emote_end)] = emote
+            watcher.choices = shifted
+            watcher.revision += 1
+        finally:
+            watcher.busy = False
+        self._decorate(watcher, text)
+
+    def _decorate(self, watcher, editable):
+        if not self._alive or watcher.busy or editable is None:
+            return
+        watcher.busy = True
+        try:
+            self._remove_spans(watcher, editable)
+            if not self._premium(watcher.account):
+                return
+            editor = watcher.editor_ref.get()
+            if editor is None:
+                return
+            plain = str(editable)
+            offsets = _utf16_offsets(plain)
+            for start, end, emote in self._matches(plain, watcher.choices):
+                first, last = offsets[start], offsets[end]
+                marker = Annotation("seven_tv_emote", emote.emote_id)
+                editable.setSpan(marker, first, last, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                watcher.spans.append(marker)
+                self._markers[int(System.identityHashCode(marker))] = emote
+                preview = self._previews.get(emote.emote_id)
+                if preview is None:
+                    self._load_preview(emote)
+                    continue
+                height = max(1, int(editor.getPaint().getFontSpacing()))
+                if emote.preview_animation_url:
+                    width = max(1, round(height * preview.width() / preview.height()))
+                    peer = _AnimatedPreviewSpan.new_instance(init_args=[preview, width, height])
+                    image_span = peer.java
+                    watcher.peers.append(peer)
+                    watcher.animated = True
+                else:
+                    width = max(1, round(height * preview.getWidth() / preview.getHeight()))
+                    drawable = BitmapDrawable(editor.getResources(), preview)
+                    drawable.setBounds(0, 0, width, height)
+                    image_span = ImageSpan(drawable, ImageSpan.ALIGN_BOTTOM)
+                editable.setSpan(image_span, first, last, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                watcher.spans.append(image_span)
+                self._visuals[int(System.identityHashCode(image_span))] = image_span
+            if watcher.animated and not self._animation_scheduled:
+                self._animation_scheduled = True
+                run_on_ui_thread(self._animation_tick, 33)
+        except Exception as exc:
+            self.log(f"7TV: composer rendering failed: {exc}")
+        finally:
+            watcher.busy = False
+            try:
+                self._update_composer_suggestions(watcher, editable)
+            except Exception as exc:
+                self._hide_composer_suggestions(watcher)
+                self.log(f"7TV: emote suggestions failed: {exc}")
+
+    def _load_preview(self, emote):
+        if emote.emote_id in self._loading_previews:
+            return
+        self._loading_previews.add(emote.emote_id)
+
+        def worker():
+            bitmap = None
+            try:
+                extension = "gif" if emote.preview_animation_url else "png"
+                path = self._storage / f"preview_{emote.emote_id}.{extension}"
+                if not path.exists():
+                    self._download(emote.preview_animation_url or emote.preview_url, path)
+                bitmap = (
+                    Movie.decodeFile(str(path)) if emote.preview_animation_url
+                    else BitmapFactory.decodeFile(str(path))
+                )
+                if bitmap is None:
+                    path.unlink(missing_ok=True)
+                    raise ValueError("Cannot decode 7TV preview")
+            except Exception as exc:
+                self.log(f"7TV: preview download failed: {exc}")
+            run_on_ui_thread(lambda: self._preview_ready(emote.emote_id, bitmap))
+
+        run_on_queue(worker)
+
+    def _animation_tick(self):
+        self._animation_scheduled = False
+        if not self._alive:
+            return
+        active = False
+        for watcher in tuple(self._editors.values()):
+            editor = watcher.editor_ref.get()
+            if watcher.animated and editor is not None and editor.isShown():
+                editor.invalidate()
+                active = True
+            for record in watcher.suggestion_records:
+                thumb = record["thumb_ref"].get()
+                if record.get("peer") is not None and thumb is not None and thumb.isShown():
+                    thumb.invalidate()
+                    active = True
+        for state in tuple(self._panels.values()):
+            for record in tuple(state["cells"].values()):
+                thumb = record["thumb_ref"].get()
+                if record.get("peer") is not None and thumb is not None and thumb.isShown():
+                    thumb.invalidate()
+                    active = True
+        if active:
+            self._animation_scheduled = True
+            run_on_ui_thread(self._animation_tick, 33)
+
+    def _preview_ready(self, emote_id, bitmap):
+        self._loading_previews.discard(emote_id)
+        if not self._alive:
+            return
+        if bitmap is not None:
+            self._previews[emote_id] = bitmap
+            self._refresh_editors()
+            self._refresh_picker_previews(emote_id)
+
+    def _setup_picker_hooks(self):
+        emoji_class = find_class("org.telegram.ui.Components.EmojiView")
+        if emoji_class is not None:
+            self.hook_all_methods(emoji_class, "onAttachedToWindow", _EmojiPanelHook(self, True))
+            for name in ("setAllow", "updateColors"):
+                self.hook_all_methods(emoji_class, name, _EmojiPanelHook(self))
+            for name in ("closeSearch", "hideSearchKeyboard"):
+                self.hook_all_methods(emoji_class, name, _EmojiPanelHook(self, close_search=True))
+        # EmojiView is an anonymous subclass in the chat. Register again after
+        # the enter view has assigned its panel, regardless of constructor hooks.
+        enter_class = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+        if enter_class is not None:
+            for name in ("createEmojiView", "showPopup"):
+                self.hook_all_methods(enter_class, name, _EnterEmojiPanelHook(self))
+
+    def _picker_notice(self, message):
+        if getattr(self, "_picker_status", None) != message:
+            self._picker_status = message
+            self.log(f"7TV: picker: {message}")
+
+    def _hook_picker_adapter(self, adapter):
+        signatures = {
+            "getCount": ("int", ()),
+            "getPageTitle": ("java.lang.CharSequence", ("int",)),
+            "getPageIconDrawable": ("android.graphics.drawable.Drawable", ("int",)),
+            "instantiateItem": ("java.lang.Object", ("android.view.ViewGroup", "int")),
+            "canScrollToTab": ("boolean", ("int",)),
+            "getItemPosition": ("int", ("java.lang.Object",)),
+        }
+        installed = set()
+        for name, signature in signatures.items():
+            clazz = adapter.getClass()
+            target = None
+            while clazz is not None:
+                methods = clazz.getDeclaredMethods()
+                matches = []
+                for index in range(len(methods)):
+                    method = methods[index]
+                    args = method.getParameterTypes()
+                    actual = (str(method.getReturnType().getName()),
+                              tuple(str(args[i].getName()) for i in range(len(args))))
+                    if actual == signature:
+                        matches.append(method)
+                named = [method for method in matches if str(method.getName()) == name]
+                if named or len(matches) == 1:
+                    target = named[0] if named else matches[0]
+                    break
+                if len(matches) > 1:
+                    raise ValueError(f"Неоднозначный метод адаптера: {name}")
+                clazz = clazz.getSuperclass()
+            if target is None:
+                if name in ("getPageIconDrawable", "canScrollToTab"):
+                    continue
+                raise ValueError(f"Нет метода адаптера: {name}")
+            key = str(target.toGenericString())
+            if key not in self._picker_adapter_hooks:
+                target.setAccessible(True)
+                handle = self.hook_method(target, _EmojiPagerHook(self, name))
+                if handle is None:
+                    raise ValueError(f"Не удалось перехватить {name}")
+                self._picker_adapter_hooks.add(key)
+            installed.add(name)
+        self.log(f"7TV: picker adapter {adapter.getClass().getName()}: {', '.join(sorted(installed))}")
+
+    @staticmethod
+    def _panel_view(state, name):
+        reference = state.get(name + "_ref")
+        return reference.get() if reference is not None else None
+
+    def _panel_available(self, state):
+        owner = state["owner_ref"].get()
+        return (
+            self._alive and owner is not None and self._premium(state["account"])
+            and int(state["native_count"]) == 3
+        )
+
+    def _attach_emoji_panel(self, owner, enter_view=None):
+        if not self._alive or owner is None:
+            return
+        key = int(System.identityHashCode(owner))
+        if key in self._panels:
+            self._refresh_emoji_panel(owner)
+            return
+        try:
+            if enter_view is None:
+                fragment = get_private_field(owner, "fragment")
+                if fragment is None:
+                    return  # The constructor may run before chat association.
+                enter_view = fragment.getChatActivityEnterView()
+            if enter_view is None:
+                return
+            assigned_panel = enter_view.getEmojiView()
+            if assigned_panel is None or int(System.identityHashCode(assigned_panel)) != key:
+                return  # Wait until createEmojiView has assigned the finished panel.
+            pager = get_private_field(owner, "pager")
+            strip = get_private_field(owner, "typeTabs")
+            adapter = pager.getAdapter() if pager is not None else None
+            if enter_view is None or pager is None or strip is None or adapter is None:
+                self._picker_notice("Панель ещё создаётся: нет pager, вкладок или адаптера")
+                return
+            account = get_private_field(enter_view, "currentAccount")
+            if account is None:
+                account = enter_view.getParentFragment().getCurrentAccount()
+            native_count = int(adapter.getCount())
+            self._hook_picker_adapter(adapter)
+            state = {
+                "owner_ref": WeakReference(owner), "enter_ref": WeakReference(enter_view),
+                "adapter_ref": WeakReference(adapter), "account": int(account),
+                "pager_ref": WeakReference(pager), "strip_ref": WeakReference(strip),
+                "native_count": native_count,
+                "query": "", "items": [], "cells": {},
+            }
+            self._panels[key] = state
+            self._panels_by_adapter[int(System.identityHashCode(adapter))] = state
+            self._refresh_emoji_panel(owner)
+        except Exception as exc:
+            self._picker_notice(f"Не удалось подключить вкладку: {exc}")
+
+    def _refresh_emoji_panels(self):
+        for key, state in tuple(self._panels.items()):
+            owner = state["owner_ref"].get()
+            if owner is None:
+                self._clear_picker_cells(state)
+                adapter = state["adapter_ref"].get()
+                if adapter is not None:
+                    self._panels_by_adapter.pop(int(System.identityHashCode(adapter)), None)
+                self._panels.pop(key, None)
+            else:
+                self._refresh_emoji_panel(owner)
+
+    def _refresh_emoji_panel(self, owner):
+        state = self._panels.get(int(System.identityHashCode(owner)))
+        if state is None:
+            return
+        try:
+            tabs = get_private_field(owner, "currentTabs")
+            if tabs is not None:
+                state["native_count"] = int(tabs.size()) - int(self._native_picker_tab_present(state, tabs))
+            self._refresh_picker_content(state)
+            pager = self._panel_view(state, "pager")
+            adapter = state["adapter_ref"].get()
+            previous_page = int(pager.getCurrentItem())
+            if not self._panel_available(state):
+                self._close_picker_search(state, notify=True)
+                self._remove_native_picker_tab(state)
+            if self._alive:
+                adapter.notifyDataSetChanged()
+            else:
+                # The engine may already have removed the position hook when
+                # this UI cleanup runs. Reset the pager to drop its fourth item.
+                pager.setAdapter(adapter)
+            if not self._panel_available(state) and previous_page == 3:
+                pager.setCurrentItem(0, False)
+            count = int(adapter.getCount())
+            strip = self._panel_view(state, "strip")
+            strip.setViewPager(pager)
+            visible_count = get_private_field(strip, "tabCount")
+            if self._panel_available(state) and count != 4 and (visible_count is None or int(visible_count) != 4):
+                # Some ART/JNI paths bypass a registered method hook. Add a real
+                # native Tab so even an unhooked getCount reads four items.
+                self._add_native_picker_tab(state)
+                adapter.notifyDataSetChanged()
+                strip.setViewPager(pager)
+                count = int(adapter.getCount())
+                visible_count = get_private_field(strip, "tabCount")
+            if self._panel_available(state) and (count == 4 or visible_count is not None and int(visible_count) == 4):
+                tab = strip.getTab(3)
+                if isinstance(tab, TextView):
+                    tab.setText("7TV")
+                if tab is not None:
+                    tab.setContentDescription("7TV")
+            if self._panel_available(state) and visible_count is not None and int(visible_count) == 4:
+                self._picker_notice("Подключена: 4 вкладки")
+            elif self._panel_available(state) and count != 4:
+                hits = state.get("count_hook_hits", 0)
+                self._picker_notice(f"Ошибка подключения: адаптер вернул {count} вместо 4 вкладок; вызовов хука: {hits}")
+            elif self._panel_available(state) and visible_count is not None and int(visible_count) != 4:
+                self._picker_notice(f"Адаптер: 4; панель показала {int(visible_count)} вкладки")
+            elif self._panel_available(state):
+                self._picker_notice("Подключена: 4 вкладки" if visible_count is not None
+                                    else "Адаптер: 4; число вкладок панели недоступно")
+            elif not self._enabled:
+                self._picker_notice("Скрыта: плагин выключен")
+            elif not self._premium(state["account"]):
+                self._picker_notice("Скрыта: аккаунту нужен Premium")
+            else:
+                self._picker_notice(f"Штатных страниц: {state['native_count']}")
+        except Exception as exc:
+            self._picker_notice(f"Не удалось обновить вкладку: {exc}")
+
+    def _native_picker_tab_present(self, state, tabs):
+        reference = state.get("native_tab_ref")
+        tab = reference.get() if reference is not None else None
+        if tab is None:
+            return False
+        key = int(System.identityHashCode(tab))
+        return any(int(System.identityHashCode(tabs.get(index))) == key for index in range(int(tabs.size())))
+
+    def _add_native_picker_tab(self, state):
+        owner = state["owner_ref"].get()
+        tabs = get_private_field(owner, "currentTabs")
+        if tabs is None or self._native_picker_tab_present(state, tabs):
+            return
+        if int(tabs.size()) != 3:
+            raise ValueError("Нельзя добавить 7TV: штатных страниц не три")
+        clazz = tabs.get(0).getClass()
+        constructors = clazz.getDeclaredConstructors()
+        target = None
+        for index in range(len(constructors)):
+            constructor = constructors[index]
+            args = constructor.getParameterTypes()
+            if len(args) == 1 and bool(args[0].isInstance(owner)):
+                target = constructor
+                break
+            if len(args) == 0:
+                target = constructor
+        if target is None:
+            raise ValueError("Не найден конструктор страницы панели")
+        target.setAccessible(True)
+        tab = target.newInstance([owner] if len(target.getParameterTypes()) else [])
+        root = self._ensure_picker_page(state)
+        if not set_private_field(tab, "type", Integer(3)) or not set_private_field(tab, "view", root):
+            raise ValueError("Не удалось заполнить страницу 7TV")
+        state["native_tab_ref"] = WeakReference(tab)
+        tabs.add(tab)
+        self.log("7TV: picker: added native fourth Tab after getCount hook bypass")
+
+    def _remove_native_picker_tab(self, state):
+        owner = state["owner_ref"].get()
+        if owner is None:
+            return
+        tabs = get_private_field(owner, "currentTabs")
+        if tabs is not None and self._native_picker_tab_present(state, tabs):
+            tabs.remove(state["native_tab_ref"].get())
+        state.pop("native_tab_ref", None)
+
+    def _refresh_picker_content(self, state):
+        state["items"] = _picker_items(
+            self._emotes, state["query"], state.get("channel_filter")
+        ) if self._panel_available(state) else []
+        self._refresh_picker_channels(state)
+        status = self._panel_view(state, "status")
+        if status is not None:
+            message = (
+                f"Смайлов: {len(state['items'])}" if state["items"]
+                else "Ничего не найдено" if self._emotes
+                else "Укажите Twitch-каналы в настройках 7TV"
+            )
+            status.setText(message)
+        peer = state.get("grid_adapter")
+        if peer is not None:
+            peer.java.notifyDataSetChanged()
+        for key, record in tuple(state["cells"].items()):
+            if record["thumb_ref"].get() is None:
+                self._clear_picker_cell(record)
+                state["cells"].pop(key, None)
+
+    def _refresh_picker_channels(self, state):
+        row = self._panel_view(state, "channel_row")
+        if row is None:
+            return
+        available = {}
+        for emote in self._emotes.values():
+            available.setdefault(emote.channel, emote)
+        channels = [name for name in _channels(self._channels_text) if name in available]
+        channels.extend(name for name in available if name not in channels)
+        if state.get("channel_filter") not in channels:
+            state["channel_filter"] = None
+        scroll_ref = state.get("channel_scroll_ref")
+        scroll = scroll_ref.get() if scroll_ref is not None else None
+        if scroll is not None:
+            scroll.setVisibility(View.VISIBLE if channels else View.GONE)
+        signature = tuple(
+            (name, self._channel_profiles.get(name, {}).get("display_name", name),
+             self._channel_avatar_urls.get(name))
+            for name in channels
+        )
+        if signature != state.get("channel_signature"):
+            row.removeAllViews()
+            state["channel_views"] = {}
+            state["all_channels_view_ref"] = None
+            if channels:
+                all_button = TextView(row.getContext())
+                all_button.setText("Все")
+                all_button.setTextSize(12.0)
+                all_button.setGravity(Gravity.CENTER)
+                all_button.setContentDescription("Показать смайлы всех каналов")
+                all_button.setOnClickListener(_PickerChannelClick(self, state, None))
+                row.addView(all_button, LinearLayout.LayoutParams(AndroidUtilities.dp(52), -1))
+                state["all_channels_view_ref"] = WeakReference(all_button)
+            for channel in channels:
+                profile = self._channel_profiles.get(channel, {})
+                display_name = str(profile.get("display_name") or channel)
+                chip = LinearLayout(row.getContext())
+                chip.setOrientation(LinearLayout.VERTICAL)
+                chip.setGravity(Gravity.CENTER)
+                chip.setContentDescription(f"Показать смайлы канала {display_name}")
+                chip.setOnClickListener(_PickerChannelClick(self, state, channel))
+                avatar = ImageView(row.getContext())
+                avatar.setScaleType(ImageView.ScaleType.CENTER_CROP)
+                avatar.setBackgroundColor(Theme.getColor(Theme.key_chat_emojiPanelBackground))
+                avatar.setContentDescription(display_name)
+                avatar.setImageBitmap(self._channel_avatar_bitmaps.get(channel))
+                chip.addView(avatar, LinearLayout.LayoutParams(AndroidUtilities.dp(42), AndroidUtilities.dp(42)))
+                label = TextView(row.getContext())
+                label.setText(display_name)
+                label.setTextSize(9.0)
+                label.setGravity(Gravity.CENTER)
+                label.setSingleLine(True)
+                label.setEllipsize(TextUtils.TruncateAt.END)
+                chip.addView(label, LinearLayout.LayoutParams(-1, AndroidUtilities.dp(18)))
+                row.addView(chip, LinearLayout.LayoutParams(AndroidUtilities.dp(60), -1))
+                state["channel_views"][channel] = WeakReference(avatar)
+                self._load_channel_avatar(channel)
+            state["channel_signature"] = signature
+        self._update_picker_channel_selection(state)
+
+    def _update_picker_channel_selection(self, state):
+        selected = state.get("channel_filter")
+        all_button = state.get("all_channels_view_ref")
+        all_button = all_button.get() if all_button is not None else None
+        if all_button is not None:
+            all_button.setAlpha(1.0 if selected is None else 0.5)
+        for channel, reference in state.get("channel_views", {}).items():
+            avatar = reference.get()
+            if avatar is not None:
+                avatar.setAlpha(1.0 if selected == channel else 0.55)
+
+    def _select_picker_channel(self, state, channel):
+        if not self._panel_available(state):
+            return
+        state["channel_filter"] = channel
+        self._refresh_picker_content(state)
+
+    def _load_channel_avatar(self, channel):
+        if channel in self._channel_avatar_bitmaps or channel in self._loading_channel_avatars:
+            return
+        url = self._channel_avatar_urls.get(channel)
+        if not url:
+            return
+        self._loading_channel_avatars.add(channel)
+
+        def worker():
+            bitmap = None
+            try:
+                fingerprint = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+                path = self._storage / f"channel_{channel}_{fingerprint}.img"
+                if not path.exists():
+                    self._download_channel_avatar(url, path)
+                bitmap = BitmapFactory.decodeFile(str(path))
+                if bitmap is None:
+                    path.unlink(missing_ok=True)
+                    raise ValueError("Cannot decode Twitch channel avatar")
+            except Exception as exc:
+                self.log(f"7TV: channel avatar download failed for {channel}: {exc}")
+            run_on_ui_thread(lambda: self._channel_avatar_ready(channel, url, bitmap))
+
+        run_on_queue(worker)
+
+    def _channel_avatar_ready(self, channel, url, bitmap):
+        self._loading_channel_avatars.discard(channel)
+        if not self._alive:
+            if bitmap is not None:
+                bitmap.recycle()
+            return
+        if self._channel_avatar_urls.get(channel) != url:
+            if bitmap is not None:
+                bitmap.recycle()
+            self._load_channel_avatar(channel)
+            return
+        if bitmap is not None:
+            previous = self._channel_avatar_bitmaps.get(channel)
+            if previous is not None:
+                previous.recycle()
+            self._channel_avatar_bitmaps[channel] = bitmap
+        for state in tuple(self._panels.values()):
+            reference = state.get("channel_views", {}).get(channel)
+            avatar = reference.get() if reference is not None else None
+            if avatar is not None and bitmap is not None:
+                avatar.setImageBitmap(bitmap)
+
+    def _ensure_picker_page(self, state):
+        root = self._panel_view(state, "root")
+        if root is not None:
+            return root
+        self._clear_picker_cells(state)
+        owner = state["owner_ref"].get()
+        context = owner.getContext()
+        dp = AndroidUtilities.dp
+        root = LinearLayout(context)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(8), dp(4), dp(8), dp(52))
+        root.setBackgroundColor(Theme.getColor(Theme.key_chat_emojiPanelBackground))
+        channel_scroll = HorizontalScrollView(context)
+        channel_scroll.setHorizontalScrollBarEnabled(False)
+        channel_row = LinearLayout(context)
+        channel_row.setOrientation(LinearLayout.HORIZONTAL)
+        channel_scroll.addView(
+            channel_row, jclass("android.widget.FrameLayout$LayoutParams")(-2, -1)
+        )
+        root.addView(channel_scroll, LinearLayout.LayoutParams(-1, dp(68)))
+        search = AndroidEditText(context)
+        search.setSingleLine(True)
+        search.setTextSize(16.0)
+        search.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        search.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        search.setHint("Найти смайл 7TV, Twitch или канал")
+        search.setText(state["query"])
+        root.addView(search, LinearLayout.LayoutParams(-1, dp(44)))
+        status = TextView(context)
+        status.setTextSize(12.0)
+        status.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        root.addView(status, LinearLayout.LayoutParams(-1, dp(26)))
+        grid = GridView(context)
+        grid.setNumColumns(GridView.AUTO_FIT)
+        grid.setColumnWidth(dp(76))
+        grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH)
+        grid.setHorizontalSpacing(dp(4))
+        grid.setVerticalSpacing(dp(4))
+        grid.setClipToPadding(False)
+        root.addView(grid, LinearLayout.LayoutParams(-1, 0, 1.0))
+        state["root_ref"] = WeakReference(root)
+        state["channel_scroll_ref"] = WeakReference(channel_scroll)
+        state["channel_row_ref"] = WeakReference(channel_row)
+        state["grid_ref"] = WeakReference(grid)
+        state["status_ref"] = WeakReference(status)
+        state["search_ref"] = WeakReference(search)
+        state["grid_adapter"] = _PickerAdapter.new_instance(init_args=[self, state])
+        state["click_listener"] = _PickerClick(self, state)
+        state["search_listener"] = _PickerSearch(self, state)
+        state["search_touch_listener"] = _PickerSearchTouch(self, state)
+        grid.setAdapter(state["grid_adapter"].java)
+        grid.setOnItemClickListener(state["click_listener"])
+        search.addTextChangedListener(state["search_listener"])
+        search.setOnTouchListener(state["search_touch_listener"])
+        self._refresh_picker_content(state)
+        return root
+
+    def _picker_cell(self, state, position, recycled, parent):
+        key = int(System.identityHashCode(recycled)) if recycled is not None else 0
+        record = state["cells"].get(key)
+        cell = recycled
+        if record is None:
+            context = parent.getContext()
+            dp = AndroidUtilities.dp
+            cell = LinearLayout(context)
+            cell.setOrientation(LinearLayout.VERTICAL)
+            cell.setGravity(Gravity.CENTER)
+            cell.setLayoutParams(jclass("android.widget.AbsListView$LayoutParams")(-1, dp(76)))
+            thumb = TextView(context)
+            thumb.setTextSize(28.0)
+            thumb.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            thumb.setGravity(Gravity.CENTER)
+            cell.addView(thumb, LinearLayout.LayoutParams(-1, dp(48)))
+            label = TextView(context)
+            label.setTextSize(10.0)
+            label.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            label.setGravity(Gravity.CENTER)
+            label.setSingleLine(True)
+            label.setEllipsize(TextUtils.TruncateAt.END)
+            cell.addView(label, LinearLayout.LayoutParams(-1, dp(20)))
+            record = {"thumb_ref": WeakReference(thumb), "label_ref": WeakReference(label), "peer": None}
+            state["cells"][int(System.identityHashCode(cell))] = record
+        emote = state["items"][position]
+        record["emote"] = emote
+        cell.setContentDescription(f"{emote.code}, {_emote_source(emote)}")
+        self._bind_picker_preview(record)
+        return cell
+
+    def _bind_picker_preview(self, record):
+        self._clear_picker_cell(record)
+        thumb = record["thumb_ref"].get()
+        label = record["label_ref"].get()
+        if thumb is None or label is None:
+            return
+        emote = record["emote"]
+        label.setText(emote.code)
+        preview = self._previews.get(emote.emote_id)
+        if preview is None:
+            thumb.setText("…")
+            self._load_preview(emote)
+            return
+        animated = bool(emote.preview_animation_url)
+        width = int(preview.width() if animated else preview.getWidth())
+        height = int(preview.height() if animated else preview.getHeight())
+        scale = min(AndroidUtilities.dp(64) / max(1, width), AndroidUtilities.dp(32) / max(1, height))
+        width, height = max(1, round(width * scale)), max(1, round(height * scale))
+        text = SpannableString(" ")
+        if animated:
+            peer = _AnimatedPreviewSpan.new_instance(init_args=[preview, width, height])
+            record["peer"] = peer
+            span = peer.java
+        else:
+            drawable = BitmapDrawable(thumb.getResources(), preview)
+            drawable.setBounds(0, 0, width, height)
+            span = ImageSpan(drawable, ImageSpan.ALIGN_BOTTOM)
+        text.setSpan(span, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        thumb.setText(text)
+        if animated and not self._animation_scheduled:
+            self._animation_scheduled = True
+            run_on_ui_thread(self._animation_tick, 33)
+
+    @staticmethod
+    def _clear_picker_cell(record):
+        peer = record.get("peer")
+        if peer is not None:
+            thumb = record["thumb_ref"].get()
+            if thumb is not None:
+                thumb.setText("")
+            peer.bitmap.recycle()
+            record["peer"] = None
+
+    def _clear_picker_cells(self, state):
+        for record in tuple(state["cells"].values()):
+            self._clear_picker_cell(record)
+        state["cells"].clear()
+
+    def _refresh_picker_previews(self, emote_id):
+        for state in tuple(self._panels.values()):
+            for record in tuple(state["cells"].values()):
+                if record.get("emote") is not None and record["emote"].emote_id == emote_id:
+                    self._bind_picker_preview(record)
+
+    def _open_picker_search(self, state, search):
+        if not self._panel_available(state):
+            return
+        try:
+            owner = state["owner_ref"].get()
+            # Native chat layout keeps the emoji panel above the keyboard only
+            # while its delegate reports an open search.
+            get_private_field(owner, "delegate").onSearchOpenClose(1)
+            search.requestFocus()
+            AndroidUtilities.showKeyboard(search)
+        except Exception as exc:
+            self.log(f"7TV: picker search failed: {exc}")
+
+    def _close_picker_search(self, state, notify=False):
+        search = self._panel_view(state, "search")
+        if search is not None and search.isFocused():
+            AndroidUtilities.hideKeyboard(search)
+            search.clearFocus()
+            owner = state["owner_ref"].get()
+            if notify and owner is not None:
+                get_private_field(owner, "delegate").onSearchOpenClose(0)
+
+    def _pick_emote(self, state, position):
+        if not self._panel_available(state) or not 0 <= position < len(state["items"]):
+            return
+        try:
+            owner = state["owner_ref"].get()
+            enter_view = state["enter_ref"].get()
+            if enter_view is None or int(System.identityHashCode(enter_view.getEmojiView())) != int(System.identityHashCode(owner)):
+                return
+            editor = enter_view.messageEditText
+            text = editor.getText()
+            first, last = int(editor.getSelectionStart()), int(editor.getSelectionEnd())
+            if first < 0 or last < 0:
+                first = last = int(text.length())
+            first, last = sorted((first, last))
+            emote = state["items"][position]
+            watcher = self._editors.get(int(System.identityHashCode(editor)))
+            if watcher is not None:
+                self._insert_composer_emote(watcher, editor, first, last, emote)
+            else:
+                insertion = _picker_insertion(
+                    str(text.subSequence(0, first)),
+                    str(text.subSequence(last, int(text.length()))), emote.code,
+                )
+                text.replace(first, last, insertion)
+                editor.setSelection(first + _utf16_offsets(insertion)[-1])
+            self._close_picker_search(state, notify=True)
+            editor.requestFocus()
+        except Exception as exc:
+            self.log(f"7TV: picker insertion failed: {exc}")
+            BulletinHelper.show_error("Не удалось вставить смайл 7TV")
+
+    def _refresh_editors(self):
+        for key, watcher in tuple(self._editors.items()):
+            editor = watcher.editor_ref.get()
+            if editor is None:
+                self._hide_composer_suggestions(watcher)
+                for span in watcher.spans:
+                    self._markers.pop(int(System.identityHashCode(span)), None)
+                    self._visuals.pop(int(System.identityHashCode(span)), None)
+                for peer in watcher.peers:
+                    peer.bitmap.recycle()
+                watcher.choices.clear()
+                self._editors.pop(key, None)
+            else:
+                self._decorate(watcher, editor.getText())
+
+    @staticmethod
+    def _download(url, path):
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not (
+            parsed.netloc == "cdn.7tv.app"
+            or (parsed.netloc == "static-cdn.jtvnw.net"
+                and parsed.path.startswith("/emoticons/v2/"))
+        ):
+            raise ValueError("Unexpected emote image URL")
+        request = Request(url, headers={"User-Agent": "exteraGram-7TV/2"})
+        with urlopen(request, timeout=20) as response:
+            data = response.read(8 * 1024 * 1024 + 1)
+        if len(data) > 8 * 1024 * 1024:
+            raise ValueError("7TV image exceeds 8 MB")
+        if not data:
+            raise ValueError("7TV returned an empty image")
+        temp = SevenTvEmojisPlugin._temporary_path(path)
+        try:
+            temp.write_bytes(data)
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _download_channel_avatar(url, path):
+        if url.startswith("//"):
+            url = "https:" + url
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in (
+            "static-cdn.jtvnw.net", "cdn.7tv.app",
+        ):
+            raise ValueError("Unexpected channel avatar URL")
+        request = Request(url, headers={"User-Agent": "exteraGram-7TV/2"})
+        with urlopen(request, timeout=20) as response:
+            data = response.read(4 * 1024 * 1024 + 1)
+        if len(data) > 4 * 1024 * 1024:
+            raise ValueError("Channel avatar exceeds 4 MB")
+        if not data:
+            raise ValueError("Channel avatar is empty")
+        temp = SevenTvEmojisPlugin._temporary_path(path)
+        try:
+            temp.write_bytes(data)
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _temporary_path(path):
+        fd, name = tempfile.mkstemp(dir=path.parent, suffix=path.suffix)
+        os.close(fd)
+        return Path(name)
+
+    @staticmethod
+    def _send_context(enter_view):
+        def identity(value):
+            return int(System.identityHashCode(value)) if value is not None else 0
+
+        fragment = enter_view.getParentFragment()
+        return (
+            int(fragment.getDialogId()),
+            identity(enter_view.getReplyingMessageObject()),
+            identity(enter_view.getEditingMessageObject()),
+            identity(fragment.getThreadMessage()),
+            identity(enter_view.JA.replyingQuote),
+        )
+
+    def _defer_send(self, enter_view, args, editing):
+        if not self._alive or not self._enabled:
+            return False
+        editor = enter_view.messageEditText
+        if editor is None:
+            return False
+        key = int(System.identityHashCode(editor))
+        watcher = self._editors.get(key)
+        if watcher is None or not self._premium(watcher.account):
+            return False
+        if enter_view.hasAudioToSend():
+            return False
+        plain = str(editor.getText())
+        missing = {
+            emote.emote_id: emote
+            for _, _, emote in self._matches(plain, watcher.choices)
+            if not self._cached_tiles(watcher.account, emote.emote_id)
+        }
+        if not missing:
+            return False
+        previous = self._pending.get(key)
+        context = self._send_context(enter_view)
+        if (
+            previous and previous["text"] == plain
+            and previous["context"] == context
+            and previous["revision"] == watcher.revision
+        ):
+            return True
+        token = object()
+        pending = {
+            "token": token, "view": WeakReference(enter_view), "text": plain,
+            "account": watcher.account, "remaining": set(missing),
+            "args": args, "editing": editing,
+            "context": context, "revision": watcher.revision,
+            "generation": self._generation,
+            "user_id": int(UserConfig.getInstance(watcher.account).getClientUserId()),
+        }
+        self._pending[key] = pending
+        self._status = f"Загрузка {len(missing)} смайлов в Telegram…"
+        for emote in missing.values():
+            self._ensure_uploaded(
+                watcher.account, emote,
+                lambda error, item_key=key, item_token=token, item_id=emote.emote_id:
+                    self._pending_done(item_key, item_token, item_id, error),
+            )
+        return True
+
+    def _pending_done(self, key, token, emote_id, error):
+        pending = self._pending.get(key)
+        if pending is None or pending["token"] is not token:
+            return
+        if error:
+            self._pending.pop(key, None)
+            self._status = f"Не удалось загрузить смайл: {error}"
+            BulletinHelper.show_error(self._status)
+            return
+        pending["remaining"].discard(emote_id)
+        if pending["remaining"]:
+            return
+        self._pending.pop(key, None)
+        enter_view = pending["view"].get()
+        try:
+            watcher = self._editors.get(key)
+            if (
+                enter_view is None or watcher is None
+                or not self._alive or not self._premium(pending["account"])
+                or self._generation != pending["generation"]
+                or watcher.revision != pending["revision"]
+                or not enter_view.messageEditText.isShown()
+                or enter_view.hasAudioToSend()
+                or str(enter_view.messageEditText.getText()) != pending["text"]
+                or self._send_context(enter_view) != pending["context"]
+                or int(UserConfig.getInstance(pending["account"]).getClientUserId()) != pending["user_id"]
+            ):
+                return
+            if pending["editing"]:
+                enter_view.doneEditingMessage()
+            else:
+                enter_view.JA.sendMessageInternal(*pending["args"])
+            self._status = "Смайлы загружены в Telegram"
+        except Exception as exc:
+            self._status = f"Повторная отправка не удалась: {exc}"
+            BulletinHelper.show_error(self._status)
+
+    def _ensure_uploaded(self, account, emote, callback):
+        if self._cached_tiles(account, emote.emote_id):
+            callback(None)
+            return
+        key = (account, emote.emote_id)
+        if key in self._waiting:
+            self._waiting[key].append(callback)
+            return
+        self._waiting[key] = [callback]
+        parts = self._account_cache(account).setdefault("parts", {}).get(emote.emote_id, [])
+        job = {
+            "account": account, "emote": emote, "index": len(parts),
+            "docs": list(parts), "stage": 0,
+            "user_id": int(UserConfig.getInstance(account).getClientUserId()),
+        }
+        self._queues.setdefault(account, []).append(job)
+        self._start_next(account)
+
+    def _start_next(self, account):
+        if not self._alive or account in self._active or not self._queues.get(account):
+            return
+        job = self._queues[account].pop(0)
+        self._active[account] = job
+
+        def worker():
+            try:
+                paths = self._prepare_tiles(job["emote"])
+                run_on_ui_thread(lambda: self._tiles_ready(job, paths, None))
+            except Exception as exc:
+                message = str(exc)
+                run_on_ui_thread(lambda: self._tiles_ready(job, None, message))
+
+        run_on_queue(worker)
+
+    def _prepare_tiles(self, emote):
+        if emote.animation_url:
+            return self._prepare_animated_tiles(emote)
+        source_path = self._storage / f"source_{emote.emote_id}.png"
+        if not source_path.exists():
+            self._download(emote.source_url, source_path)
+        bitmap = BitmapFactory.decodeFile(str(source_path))
+        if bitmap is None:
+            source_path.unlink(missing_ok=True)
+            raise ValueError("Cannot decode 7TV PNG")
+        bitmap.setDensity(0)
+        paths = []
+        try:
+            width, height = int(bitmap.getWidth()), int(bitmap.getHeight())
+            origins = _tile_origins(width, height)
+            if not origins:
+                raise ValueError("7TV image has invalid dimensions")
+            for index, (left, top) in enumerate(origins):
+                if not self._alive:
+                    raise RuntimeError("Plugin unloaded during conversion")
+                path = self._storage / f"tile_{emote.emote_id}_{index}.png"
+                if not path.exists():
+                    temp = self._temporary_path(path)
+                    tile = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+                    tile.setDensity(0)
+                    try:
+                        canvas = Canvas(tile)
+                        offset_y = (100 - height) // 2 if height < 100 else -top
+                        offset_x = (100 - width) // 2 if width < 100 else -left
+                        canvas.drawBitmap(bitmap, float(offset_x), float(offset_y), None)
+                        stream = FileOutputStream(str(temp))
+                        try:
+                            if not tile.compress(Bitmap.CompressFormat.PNG, 100, stream):
+                                raise ValueError("PNG export failed")
+                        finally:
+                            stream.close()
+                        os.replace(temp, path)
+                    finally:
+                        tile.recycle()
+                        temp.unlink(missing_ok=True)
+                paths.append(str(path))
+        finally:
+            bitmap.recycle()
+        return paths
+
+    def _prepare_animated_tiles(self, emote):
+        source_path = self._storage / f"source_{emote.emote_id}.gif"
+        if not source_path.exists():
+            self._download(emote.animation_url, source_path)
+        movie = Movie.decodeFile(str(source_path))
+        if movie is None or movie.width() <= 0 or movie.height() <= 0:
+            source_path.unlink(missing_ok=True)
+            raise ValueError("Cannot decode animated 7TV GIF")
+        width, height = int(movie.width()), int(movie.height())
+        origins = _tile_origins(width, height)
+        if not origins:
+            raise ValueError("7TV animation has invalid dimensions")
+        source_duration = max(1, int(movie.duration()))
+        paths = []
+        for index, (left, top) in enumerate(origins):
+            if not self._alive:
+                raise RuntimeError("Plugin disabled during conversion")
+            path = self._storage / f"tile_{emote.emote_id}_{index}.webm"
+            quality_path = self._video_quality_path(path)
+            if path.exists() and 0 < path.stat().st_size <= _VIDEO_TARGET_BYTES:
+                paths.append(str(path))
+                continue
+            path.unlink(missing_ok=True)
+            quality_path.unlink(missing_ok=True)
+            self._encode_animated_tile(
+                movie, emote.emote_id, index, path, width, height,
+                left, top, source_duration, 0,
+            )
+            paths.append(str(path))
+        return paths
+
+    @staticmethod
+    def _video_quality_path(path):
+        path = Path(path)
+        return path.with_name(path.name + ".quality")
+
+    def _encode_animated_tile(
+        self, movie, emote_id, index, path, width, height,
+        left, top, source_duration, start_level,
+    ):
+        try:
+            encoder = jclass("org.telegram.messenger.video.WebmEncoder").JA
+        except Exception as exc:
+            raise RuntimeError("This exteraGram build has no WebM sticker encoder") from exc
+        duration = min(3000, source_duration)
+        quality_path = self._video_quality_path(path)
+        for level in range(int(start_level), len(_VIDEO_PROFILES)):
+            bitrate, fps = _VIDEO_PROFILES[level]
+            frame_count = max(1, math.ceil(duration * fps / 1000))
+            temp = self._temporary_path(path)
+            tile = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+            tile.setDensity(0)
+            pointer = 0
+            try:
+                buffer = ByteBuffer.allocateDirect(tile.getByteCount())
+                pointer = int(encoder.createEncoder(str(temp), 100, 100, fps, bitrate))
+                if not pointer:
+                    raise RuntimeError("Cannot initialise WebM encoder")
+                canvas = Canvas(tile)
+                for frame in range(frame_count):
+                    if not self._alive:
+                        raise RuntimeError("Plugin unloaded during WebM compression")
+                    tile.eraseColor(0)
+                    movie.setTime(int(frame * source_duration / frame_count))
+                    offset_y = (100 - height) // 2 if height < 100 else -top
+                    offset_x = (100 - width) // 2 if width < 100 else -left
+                    movie.draw(canvas, float(offset_x), float(offset_y))
+                    buffer.clear()
+                    tile.copyPixelsToBuffer(buffer)
+                    buffer.flip()
+                    if not encoder.writeFrame(pointer, buffer, 100, 100):
+                        raise RuntimeError("WebM frame encoding failed")
+                encoder.stop(pointer)
+                pointer = 0
+                size = int(temp.stat().st_size)
+                if 0 < size <= _VIDEO_TARGET_BYTES:
+                    os.replace(temp, path)
+                    try:
+                        quality_path.write_text(str(level), "ascii")
+                    except OSError:
+                        pass
+                    return level
+            finally:
+                if pointer:
+                    encoder.stop(pointer)
+                tile.recycle()
+                temp.unlink(missing_ok=True)
+        raise ValueError(
+            f"Unable to compress WebM tile below {_VIDEO_TARGET_BYTES} bytes "
+            f"(Telegram limit {_VIDEO_MAX_BYTES} bytes)"
+        )
+
+    def _recompress_rejected_tile(self, emote, index, path):
+        source_path = self._storage / f"source_{emote.emote_id}.gif"
+        if not source_path.exists():
+            self._download(emote.animation_url, source_path)
+        movie = Movie.decodeFile(str(source_path))
+        if movie is None or movie.width() <= 0 or movie.height() <= 0:
+            raise ValueError("Cannot decode animated 7TV GIF for recompression")
+        width, height = int(movie.width()), int(movie.height())
+        origins = _tile_origins(width, height)
+        if index < 0 or index >= len(origins):
+            raise ValueError("Animated 7TV tile index is invalid")
+        try:
+            quality_path = self._video_quality_path(path)
+            try:
+                current_level = int(quality_path.read_text("ascii").strip())
+            except (OSError, ValueError):
+                # Files made by previous plugin versions have no quality marker;
+                # their encoder already tried 128, 64 and 32 kbit/s.
+                current_level = 2
+            if current_level < 0 or current_level >= len(_VIDEO_PROFILES) - 1:
+                raise ValueError("Telegram rejected the most-compressed WebM profile")
+            left, top = origins[index]
+            return self._encode_animated_tile(
+                movie, emote.emote_id, index, path, width, height,
+                left, top, max(1, int(movie.duration())), current_level + 1,
+            )
+        finally:
+            movie = None
+
+    def _tiles_ready(self, job, paths, error):
+        if not self._alive or self._active.get(job["account"]) is not job:
+            return
+        if error:
+            self._finish_job(job, error)
+            return
+        job["paths"] = paths
+        cache = self._account_cache(job["account"])
+        if not cache["packs"] and not cache.get("packs_checked"):
+            self._find_owned_pack(job)
+            return
+        self._upload_next_tile(job)
+
+    def _find_owned_pack(self, job, offset=0):
+        request = TLRPC.TL_messages_getMyStickers()
+        request.offset_id = offset
+        request.limit = 100
+        self._job_request(
+            job, request,
+            lambda response, error: self._owned_packs_ready(job, offset, response, error),
+        )
+
+    def _owned_packs_ready(self, job, offset, response, error):
+        if error is not None or not isinstance(response, TLRPC.TL_messages_myStickers):
+            self._finish_job(job, "Поиск существующих emoji-паков: " + str(getattr(error, "text", "неверный ответ Telegram")))
+            return
+        cache = self._account_cache(job["account"])
+        sets = _java_list(response.sets)
+        for covered in sets:
+            info = covered.set
+            name = str(info.short_name or "")
+            title = str(info.title or "")
+            if (
+                info.emojis and name and int(info.count) < 190
+                and (name.startswith("SevenTV_") or title in (_PACK_TITLE, "7TV Emojis (exteraGram)"))
+            ):
+                cache["packs"].append({"name": name, "count": int(info.count)})
+                cache["packs_checked"] = True
+                self._save_cache()
+                self.log(f"7TV: reusing owned emoji pack {name} ({info.count} documents)")
+                self._upload_next_tile(job)
+                return
+        if len(sets) == 100:
+            next_offset = int(sets[-1].set.id)
+            if next_offset == offset:
+                self._finish_job(job, "Telegram repeated the emoji-pack pagination offset")
+                return
+            self._find_owned_pack(job, next_offset)
+            return
+        cache["packs_checked"] = True
+        self._save_cache()
+        self._upload_next_tile(job)
+
+    def _observe_uploads(self, account):
+        if account in self._observers:
+            return
+        observer = _UploadObserver(self)
+        center = get_notification_center(account)
+        center.addObserver(observer, NotificationCenter.fileUploaded)
+        center.addObserver(observer, NotificationCenter.fileUploadFailed)
+        self._observers[account] = observer
+
+    def _upload_next_tile(self, job):
+        try:
+            self._upload_next_tile_checked(job)
+        except Exception as exc:
+            self._finish_job(job, str(exc))
+
+    def _upload_next_tile_checked(self, job):
+        if int(UserConfig.getInstance(job["account"]).getClientUserId()) != job["user_id"]:
+            raise RuntimeError("Telegram account changed during upload")
+        index = job["index"]
+        if index >= len(job["paths"]):
+            self._account_cache(job["account"])["emotes"][job["emote"].emote_id] = job["docs"]
+            self._account_cache(job["account"]).setdefault("parts", {}).pop(job["emote"].emote_id, None)
+            self._save_cache()
+            self._finish_job(job, None)
+            return
+        path = job["paths"][index]
+        self._observe_uploads(job["account"])
+        self._uploads[(job["account"], path)] = job
+        self._arm_job(job, "Загрузка файла в Telegram")
+        get_file_loader(job["account"]).uploadFile(
+            path, False, True, ConnectionsManager.FileTypeFile
+        )
+
+    def _on_upload_event(self, event_id, account, args):
+        if not self._alive or event_id not in (
+            NotificationCenter.fileUploaded, NotificationCenter.fileUploadFailed
+        ):
+            return
+        path = str(args[0])
+        job = self._uploads.pop((account, path), None)
+        if job is None or job["account"] != account:
+            return
+        if self._active.get(account) is not job:
+            return
+        if event_id == NotificationCenter.fileUploadFailed:
+            self._finish_job(job, "Telegram file upload failed")
+            return
+        try:
+            self._send_uploaded_file(job, path, args[1])
+        except Exception as exc:
+            self._finish_job(job, str(exc))
+
+    def _send_uploaded_file(self, job, path, uploaded_file):
+        request = TLRPC.TL_messages_uploadMedia()
+        request.peer = TLRPC.TL_inputPeerSelf()
+        request.media = TLRPC.TL_inputMediaUploadedDocument()
+        request.media.file = uploaded_file
+        request.media.mime_type = "video/webm" if path.endswith(".webm") else "image/png"
+        attribute = TLRPC.TL_documentAttributeSticker()
+        attribute.alt = _ALT
+        attribute.stickerset = TLRPC.TL_inputStickerSetEmpty()
+        request.media.attributes.add(attribute)
+        self._job_request(
+            job, request, lambda response, error: self._uploaded_media(job, response, error),
+        )
+
+    def _arm_job(self, job, description):
+        job["stage"] += 1
+        stage = job["stage"]
+
+        def timeout():
+            if self._alive and self._active.get(job["account"]) is job and job["stage"] == stage:
+                self._finish_job(job, description + ": превышено время ожидания")
+
+        run_on_ui_thread(timeout, 90000)
+        return stage
+
+    def _job_request(self, job, request, callback):
+        stage = self._arm_job(job, "Запрос Telegram")
+
+        def deliver(response, error):
+            if not self._alive or self._active.get(job["account"]) is not job or job["stage"] != stage:
+                return
+            try:
+                if int(UserConfig.getInstance(job["account"]).getClientUserId()) != job["user_id"]:
+                    raise RuntimeError("Telegram account changed during upload")
+                callback(response, error)
+            except Exception as exc:
+                self._finish_job(job, str(exc))
+
+        send_request(
+            request,
+            lambda response, error: run_on_ui_thread(lambda: deliver(response, error)),
+            account=job["account"],
+        )
+
+    def _uploaded_media(self, job, response, error):
+        if not self._alive or self._active.get(job["account"]) is not job:
+            return
+        if error is not None or not isinstance(response, TLRPC.TL_messageMediaDocument):
+            if (
+                str(getattr(error, "text", "")) == "STICKER_VIDEO_BIG"
+                and self._retry_video_compression(job)
+            ):
+                return
+            self._finish_job(job, getattr(error, "text", "Telegram media upload failed"))
+            return
+        document = response.document
+        item = TLRPC.TL_inputStickerSetItem()
+        item.document = TLRPC.TL_inputDocument()
+        item.document.id = document.id
+        item.document.access_hash = document.access_hash
+        item.document.file_reference = document.file_reference
+        item.emoji = _ALT
+        if not job.get("keywords_disabled"):
+            try:
+                item.keywords = self._tile_keyword(job)
+                item.flags = int(getattr(item, "flags", 0)) | 2
+            except Exception as exc:
+                # Some exteraGram builds expose TL_inputStickerSetItem without
+                # the layer-147 keywords fields through the Python bridge.
+                # The normal ID/new-document resolver remains valid without it.
+                job["keywords_disabled"] = True
+                try:
+                    item.keywords = None
+                except Exception:
+                    pass
+                try:
+                    item.flags = 0
+                except Exception:
+                    pass
+                self.log(f"7TV: TL_inputStickerSetItem keywords unavailable: {exc}")
+        cache = self._account_cache(job["account"])
+        packs = cache["packs"]
+        pack = packs[-1] if packs and int(packs[-1]["count"]) < 190 else None
+        if pack is None:
+            request = TLRPC.TL_stickers_createStickerSet()
+            request.user_id = TLRPC.TL_inputUserSelf()
+            request.title = _PACK_TITLE
+            # Supply both names explicitly: an empty short_name relies on
+            # undocumented server-side generation used by the sticker editor.
+            request.short_name = "SevenTV_" + uuid4().hex
+            request.flags = 1 << 5
+            request.masks = False
+            request.emojis = True
+            request.stickers.add(item)
+            job["pack_title"] = str(request.title)
+            job["pack_name"] = str(request.short_name)
+            job["pack_name_attempts"] = job.get("pack_name_attempts", 0) + 1
+        else:
+            request = TLRPC.TL_messages_getStickerSet()
+            request.stickerset = TLRPC.TL_inputStickerSetShortName()
+            request.stickerset.short_name = pack["name"]
+            request.hash = 0
+            self._job_request(
+                job, request,
+                lambda result, req_error: self._pack_before_add(job, document, item, pack, result, req_error),
+            )
+            return
+        self._job_request(
+            job, request,
+            lambda result, req_error: self._sticker_added(job, document, pack, result, req_error),
+        )
+
+    def _retry_video_compression(self, job):
+        index = int(job.get("index", -1))
+        paths = job.get("paths", [])
+        if index < 0 or index >= len(paths):
+            return False
+        path = Path(paths[index])
+        if path.suffix != ".webm":
+            return False
+        quality_path = self._video_quality_path(path)
+        try:
+            current_level = int(quality_path.read_text("ascii").strip())
+        except (OSError, ValueError):
+            current_level = 2
+        if current_level < 0 or current_level >= len(_VIDEO_PROFILES) - 1:
+            return False
+        try:
+            old_size = int(path.stat().st_size)
+        except OSError:
+            old_size = 0
+        stage = self._arm_job(job, "Сжатие WEBM после отказа Telegram")
+        self.log(
+            f"7TV: Telegram rejected WEBM tile {index} ({old_size} bytes); "
+            f"retrying with a lower-quality profile"
+        )
+
+        def worker():
+            error = None
+            try:
+                level = self._recompress_rejected_tile(job["emote"], index, path)
+            except Exception as exc:
+                level = None
+                error = str(exc)
+
+            def finish():
+                if (
+                    not self._alive or self._active.get(job["account"]) is not job
+                    or job.get("stage") != stage
+                ):
+                    return
+                if error:
+                    self._finish_job(job, error)
+                    return
+                try:
+                    new_size = int(path.stat().st_size)
+                except OSError:
+                    new_size = 0
+                self.log(
+                    f"7TV: recompressed WEBM tile {index} with profile {level} "
+                    f"({new_size} bytes); retrying upload"
+                )
+                self._upload_next_tile(job)
+
+            run_on_ui_thread(finish)
+
+        run_on_queue(worker)
+        return True
+
+    def _pack_before_add(self, job, uploaded, item, pack, response, error):
+        if error is not None or not isinstance(response, TLRPC.TL_messages_stickerSet):
+            if str(getattr(error, "text", "")) == "STICKERSET_INVALID":
+                pack["count"] = 190
+                self._save_cache()
+                self._uploaded_media(job, self._media_response(uploaded), None)
+                return
+            self._finish_job(job, "Не удалось прочитать emoji-пак: " + str(getattr(error, "text", "неверный ответ Telegram")))
+            return
+        if not response.set.emojis or str(response.set.short_name) != pack["name"]:
+            self._finish_job(job, "Выбранный набор не является emoji-паком")
+            return
+        before_ids = {int(document.id) for document in _java_list(response.documents)}
+        pack["count"] = len(before_ids)
+        self._save_cache()
+        # Recover a previous successful add whose response could not be resolved.
+        matched_ids = self._keyword_document_ids(response, self._tile_keyword(job))
+        if len(matched_ids) == 1:
+            existing = next((doc for doc in _java_list(response.documents)
+                             if int(doc.id) in matched_ids), None)
+            if existing is not None:
+                self._save_resolved_emoji(job, response, existing)
+                return
+        if pack["count"] >= 190:
+            self._uploaded_media(job, self._media_response(uploaded), None)
+            return
+        request = TLRPC.TL_stickers_addStickerToSet()
+        request.stickerset = TLRPC.TL_inputStickerSetShortName()
+        request.stickerset.short_name = pack["name"]
+        request.sticker = item
+        self._job_request(
+            job, request,
+            lambda result, req_error: self._sticker_added(job, uploaded, pack, result, req_error, before_ids),
+        )
+
+    def _sticker_added(self, job, uploaded, pack, response, error, before_ids=None):
+        if not self._alive or self._active.get(job["account"]) is not job:
+            return
+        if error is not None or not isinstance(response, TLRPC.TL_messages_stickerSet):
+            code = str(getattr(error, "text", ""))
+            if code == "STICKER_VIDEO_BIG" and self._retry_video_compression(job):
+                return
+            if code == "STICKER_KEYWORDS_INVALID" and not job.get("keywords_disabled"):
+                job["keywords_disabled"] = True
+                self.log("7TV: Telegram rejected item keywords; retrying without keywords")
+                self._uploaded_media(job, self._media_response(uploaded), None)
+                return
+            if pack is None:
+                self.log(
+                    f"7TV: createStickerSet rejected: {code}; "
+                    f"title={job.get('pack_title')!r}; "
+                    f"short_name={job.get('pack_name')!r}; emojis=True"
+                )
+                if code == "PACK_SHORT_NAME_OCCUPIED" and job.get("pack_name_attempts", 0) < 3:
+                    self._uploaded_media(job, self._media_response(uploaded), None)
+                    return
+            if pack is not None and code in ("STICKERSET_INVALID", "STICKERS_TOO_MUCH"):
+                # Retry this tile in a new pack. Previously completed tiles stay cached.
+                pack["count"] = 190
+                self._uploaded_media(job, self._media_response(uploaded), None)
+                return
+            self._finish_job(job, getattr(error, "text", "Cannot create emoji pack"))
+            return
+        documents = _java_list(response.documents)
+        name = str(response.set.short_name)
+        if pack is None:
+            pack = {"name": name, "count": len(documents)}
+            self._account_cache(job["account"])["packs"].append(pack)
+        pack["count"] = len(documents)
+        # The set already exists on the server. Keep it even if identifying the
+        # new emoji fails, so retrying cannot create another orphan set.
+        self._save_cache()
+        self._resolve_added_emoji(job, uploaded, pack, response, before_ids or set())
+
+    @staticmethod
+    def _tile_keyword(job):
+        identity = f"{job['emote'].emote_id}:{job['index']}"
+        return "seventv" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _keyword_document_ids(response, keyword):
+        entries = getattr(response, "keywords", None)
+        if entries is None:
+            return set()
+        return {
+            int(entry.document_id) for entry in _java_list(entries)
+            if any(str(word).casefold() == keyword.casefold()
+                   for word in _java_list(entry.keyword))
+        }
+
+    def _resolve_added_emoji(self, job, uploaded, pack, response, before_ids, refreshed=False):
+        if not self._alive or self._active.get(job["account"]) is not job:
+            return
+        if not response.set.emojis or str(response.set.short_name) != pack["name"]:
+            self._finish_job(job, "Telegram вернул другой набор вместо emoji-пака")
+            return
+        documents = _java_list(response.documents)
+        pack["count"] = len(documents)
+        self._save_cache()
+        matched_ids = self._keyword_document_ids(response, self._tile_keyword(job))
+        document = self._select_added_document(documents, int(uploaded.id), before_ids, matched_ids)
+        if document is None:
+            self.log(
+                f"7TV: cannot identify added emoji; pack={pack['name']}; upload_id={uploaded.id}; "
+                f"before_ids={sorted(before_ids)}; keyword_ids={sorted(matched_ids)}; "
+                f"refreshed={refreshed}; "
+                f"returned_ids={[int(item.id) for item in documents]}"
+            )
+            if not refreshed:
+                # Read once more without re-uploading or adding another sticker.
+                request = TLRPC.TL_messages_getStickerSet()
+                request.stickerset = TLRPC.TL_inputStickerSetShortName()
+                request.stickerset.short_name = pack["name"]
+                request.hash = 0
+
+                def received(result, error):
+                    if error is not None or not isinstance(result, TLRPC.TL_messages_stickerSet):
+                        self._finish_job(job, "Не удалось перечитать emoji-пак: " +
+                                         str(getattr(error, "text", "неверный ответ Telegram")))
+                        return
+                    self._resolve_added_emoji(job, uploaded, pack, result, before_ids, True)
+
+                self._job_request(job, request, received)
+                return
+            self._finish_job(job, "Telegram не вернул ID загруженного смайла. Пак сохранён; подробности в логе 7TV")
+            return
+        self._save_resolved_emoji(job, response, document)
+
+    def _save_resolved_emoji(self, job, response, document):
+        if not self._alive or self._active.get(job["account"]) is not job:
+            return
+        if not response.set.emojis or int(document.id) <= 0:
+            self._finish_job(job, "Telegram вернул неверный документ emoji-пака")
+            return
+        # Identity comes from the verified emoji set, not the presence of alt.
+        # The emoji associated with every upload in this plugin is _ALT.
+        alt = self._document_alt(document) or _ALT
+        MediaDataController.getInstance(job["account"]).putStickerSet(response)
+        job["docs"].append({"id": int(document.id), "alt": alt})
+        job["index"] += 1
+        self._account_cache(job["account"]).setdefault("parts", {})[job["emote"].emote_id] = list(job["docs"])
+        self._save_cache()
+        job.pop("pack_name_attempts", None)
+        self._upload_next_tile(job)
+
+    def _select_added_document(self, documents, upload_id, before_ids, keyword_ids=None):
+        documents = [document for document in documents if int(document.id) > 0]
+        exact = next((document for document in documents if int(document.id) == upload_id), None)
+        if exact is not None:
+            return exact
+        if keyword_ids and len(keyword_ids) == 1:
+            marked = next((document for document in documents
+                           if int(document.id) in keyword_ids), None)
+            if marked is not None:
+                return marked
+        # Telegram may turn an uploaded sticker document into a custom emoji
+        # with a different ID. Identify the one new document, independent of
+        # its position in the returned set.
+        added = [document for document in documents if int(document.id) not in before_ids]
+        return added[0] if len(added) == 1 else None
+
+    @staticmethod
+    def _media_response(document):
+        response = TLRPC.TL_messageMediaDocument()
+        response.document = document
+        return response
+
+    @staticmethod
+    def _document_alt(document):
+        try:
+            for attribute in _java_list(document.attributes):
+                if isinstance(attribute, TLRPC.TL_documentAttributeCustomEmoji):
+                    return str(attribute.alt)
+        except Exception:
+            pass
+        return None
+
+    def _finish_job(self, job, error):
+        account = job["account"]
+        if self._active.get(account) is not job:
+            return
+        self._active.pop(account, None)
+        for upload_key, current in tuple(self._uploads.items()):
+            if current is job:
+                self._uploads.pop(upload_key, None)
+                try:
+                    get_file_loader(account).cancelFileUpload(upload_key[1], False)
+                except Exception:
+                    pass
+        key = (account, job["emote"].emote_id)
+        callbacks = self._waiting.pop(key, [])
+        for callback in callbacks:
+            try:
+                callback(error)
+            except Exception as exc:
+                self.log(f"7TV: completion callback failed: {exc}")
+        self._start_next(account)
+
+    def _convert_entities(self, text, account):
+        if not self._alive or not self._premium(account):
+            return None
+        try:
+            spans = text.getSpans(0, int(text.length()), Annotation)
+        except Exception:
+            return None
+        replacements = []
+        for marker in spans:
+            emote = self._markers.get(int(System.identityHashCode(marker)))
+            if emote is None:
+                continue
+            tiles = self._cached_tiles(account, emote.emote_id)
+            if not tiles:
+                continue
+            start = int(text.getSpanStart(marker))
+            end = int(text.getSpanEnd(marker))
+            if start < 0 or end <= start or str(text.subSequence(start, end)) != emote.code:
+                continue
+            replacements.append((start, end, marker, tiles))
+        if not replacements:
+            return None
+        builder = SpannableStringBuilder(text)
+        for span in text.getSpans(0, int(text.length()), ReplacementSpan):
+            if int(System.identityHashCode(span)) in self._visuals:
+                builder.removeSpan(span)
+        for start, end, marker, tiles in sorted(
+            replacements, key=lambda item: item[0], reverse=True
+        ):
+            builder.removeSpan(marker)
+            replacement = SpannableStringBuilder("")
+            for document_id, alt in tiles:
+                part = SpannableString(alt)
+                part.setSpan(
+                    AnimatedEmojiSpan(document_id, None),
+                    0, int(part.length()), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+                replacement.append(part)
+            builder.replace(start, end, replacement)
+        return builder

@@ -1,0 +1,42 @@
+# Local Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and local workspace metadata
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# AI assistant and agent workspace metadata
+.codex/
+.agents/
+.cursor/
+.claude/
+.continue/
+.windsurf/
+.roo/
+.aider*
+.github/copilot-instructions.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+AI_NOTES.md
+PROMPTS.md
+
+# Local secrets and generated caches
+.env
+.env.*
+!.env.example
+*.log
+cache/
+tmp/
+temp/
